@@ -133,6 +133,7 @@ input[type=range]:focus-visible{outline:2px solid var(--accent);outline-offset:4
 .field>span{display:block;font-size:13px;color:var(--hint);margin-bottom:4px}
 .field input,.field select{width:100%;border:1px solid transparent;background:var(--bg2);border-radius:12px;padding:12px;font-size:16px;outline:none}
 .field input:focus,.field select:focus{border-color:var(--accent)}
+.field input[type=date]{min-width:0;max-width:100%;min-height:46px;-webkit-appearance:none;appearance:none;text-align:left}
 .two{display:flex;gap:10px}.two>*{flex:1;min-width:0}
 .field[hidden]{display:none}
 .dash-card{background:var(--bg2);border-radius:var(--radius-lg);padding:12px 14px;margin-bottom:12px}
@@ -1082,9 +1083,12 @@ const HOUSING = { n: 'Аренда и коммуналка', i: '🏠' };
 const statKey = e => e.rule ? (KINDS[e.rule.kind].util ? 'housing' : 'rule:' + e.rule.id) : e.op.cat === 'util' ? 'housing' : e.op.cat;
 function catKeyInfo(k){
   if (k === 'housing') return HOUSING;
+  if (k.startsWith('personal:')){ const m = MEMBERS.find(x => x.id === +k.slice(9)); return { n: m ? m.name.split(' ')[0] : 'Личные', i: '🕶️' }; }
   if (k.startsWith('rule:')){ const r = S.rules.find(x => x.id === k.slice(5)); return r ? { n: r.name, i: KINDS[r.kind].icon } : { n: 'Регулярный платёж', i: '🔁' }; }
   return catOf(k);
 }
+// Общая сторона: основной счёт, «извне» и общие копилки. Всё остальное — личные счета (свои и чужие).
+const sharedSide = id => id === 'main' || id === 'ext' || (S.accounts || []).some(a => a.id === id);
 function monthStats(y, m){
   const prefix = `${y}-${pad(m+1)}`, t = today();
   const r = { inc: 0, out: 0, outToDate: 0, saved: 0, byCat: {}, items: {} };
@@ -1092,7 +1096,17 @@ function monthStats(y, m){
     if (!d.startsWith(prefix)) return;
     for (const e of list){
       if (e.priv) continue;                                  // личные траты в общую статистику не входят
-      if (isMove(e)){ r.saved -= e.amount; continue; }      // с основного на копилки — «отложено»
+      if (isMove(e)){
+        const o = e.op;
+        if ((o.from === 'main' && !sharedSide(o.to)) || (o.to === 'main' && !sharedSide(o.from))){
+          // деньги ушли с общего счёта на личный (или вернулись): это расход «на имя» владельца, а не «отложено»
+          const k = 'personal:' + (o.by || 0), v = -e.amount;
+          r.out += v; if (d <= t) r.outToDate += v;
+          r.byCat[k] = (r.byCat[k] || 0) + v;
+          (r.items[k] = r.items[k] || []).push({ e, v, d });
+        } else r.saved -= e.amount;      // с основного на общие копилки — «отложено»
+        continue;
+      }
       if (e.amount > 0){ r.inc += e.amount; continue; }
       const k = statKey(e), v = -e.amount;
       r.out += v; if (d <= t) r.outToDate += v;
@@ -1100,6 +1114,10 @@ function monthStats(y, m){
       (r.items[k] = r.items[k] || []).push({ e, v, d });
     }
   });
+  for (const k of Object.keys(r.byCat)) if (k.startsWith('personal:') && r.byCat[k] <= 0){
+    const back = -r.byCat[k]; r.inc += back; r.out += back; r.outToDate = Math.max(0, r.outToDate + back);
+    delete r.byCat[k]; delete r.items[k];
+  }
   return r;
 }
 function donutSvg(parts, total){
@@ -1201,8 +1219,8 @@ function catItems(k, st){
   openSheet(`
     <h2>${esc(c.i)} ${esc(c.n)}</h2>
     <p class="hint" style="margin:-6px 0 8px">${monthTitle(SM.y, SM.m)} · ${fmtMoney(st.byCat[k])} · ${pct(st.byCat[k], st.out)}% расходов</p>
-    <ul class="list">${items.map((it, i) => `<li class="row" data-i="${i}"><span class="t">${fmtDate(it.d)}${it.d > today() ? ' · план' : ''}<small>${esc(it.e.rule ? it.e.rule.name + (it.e.orig.util ? ` · аренда ${fmtCur(it.e.orig.amount, it.e.orig.cur)} + коммуналка ≈ ${fmtCur(it.e.orig.util, it.e.orig.ucur)}` : '') : it.e.op.note || catOf(it.e.op.cat).n)}</small></span><span class="a num negc">−${fmtMoney(it.v)}</span></li>`).join('')}</ul>`,
-  b => b.querySelectorAll('[data-i]').forEach(el => el.onclick = () => { const e = items[+el.dataset.i].e; e.rule ? editOccurrence(e) : editOp(e.op); }));
+    <ul class="list">${items.map((it, i) => `<li class="row" data-i="${i}"><span class="t">${fmtDate(it.d)}${it.d > today() ? ' · план' : ''}<small>${esc(it.e.rule ? it.e.rule.name + (it.e.orig.util ? ` · аренда ${fmtCur(it.e.orig.amount, it.e.orig.cur)} + коммуналка ≈ ${fmtCur(it.e.orig.util, it.e.orig.ucur)}` : '') : it.e.op.note || (it.e.op.cat === 'move' ? (it.v > 0 ? 'перевод на личный счёт' : 'возврат с личного счёта') : catOf(it.e.op.cat).n))}</small></span><span class="a num ${it.v < 0 ? 'pos' : 'negc'}">${it.v < 0 ? '+' : '−'}${fmtMoney(Math.abs(it.v))}</span></li>`).join('')}</ul>`,
+  b => b.querySelectorAll('[data-i]').forEach(el => el.onclick = () => { const e = items[+el.dataset.i].e; e.rule ? editOccurrence(e) : isMove(e) ? editMove(e.op) : editOp(e.op); }));
 }
 
 /* Управление категориями: свои — создать/изменить/удалить, встроенные — скрыть из списка */
@@ -1364,10 +1382,8 @@ function editOp(op, sign, draft){
     <h2>${isNew ? (sign < 0 ? 'Новый расход' : 'Новый доход') : 'Изменить запись'}</h2>
     ${amtField('Сумма', 'f_a', d.amount || '', d.cur || BASE)}
     <div class="chips">${cats.map(([k, c]) => `<label><input type="radio" name="cat" value="${k}" ${k === cur ? 'checked' : ''}>${esc(c.i)} ${esc(c.n)}</label>`).join('')}${sign < 0 ? '<label id="f_newcat" style="color:var(--accent)">＋ Своя</label>' : ''}</div>
-    <div class="two">
-      <label class="field"><span>Дата</span><input id="f_d" type="date" value="${d.date || SEL}"></label>
-      <label class="field"><span>Комментарий</span><input id="f_n" value="${esc(d.note || '')}" placeholder="необязательно"></label>
-    </div>
+    <label class="field"><span>Дата</span><input id="f_d" type="date" value="${d.date || SEL}"></label>
+    <label class="field"><span>Комментарий</span><input id="f_n" value="${esc(d.note || '')}" placeholder="необязательно"></label>
     ${SHARED ? `<label class="switch"><span>🕶️ Инкогнито<br><small class="hint">Видно только вам, считается с личного счёта, общий остаток не меняется</small></span><input type="checkbox" id="f_inc" ${d.inc ? 'checked' : ''}></label>` : ''}
     <button class="btn block" id="f_save">${isNew ? 'Добавить' : 'Сохранить'}</button>
     ${isNew ? '' : '<button class="btn danger block" id="f_del">Удалить</button>'}`,
