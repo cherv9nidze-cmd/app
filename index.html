@@ -97,6 +97,7 @@ input[type=range]:focus-visible{outline:2px solid var(--accent);outline-offset:4
 .row .a{font-weight:700;white-space:nowrap}
 .by{display:inline-flex;align-items:center;gap:4px;margin-left:8px;color:var(--hint);font-size:12px;font-weight:400;vertical-align:1px}
 .av{width:16px;height:16px;border-radius:50%;object-fit:cover;background:var(--accent);color:var(--accent-text,#fff);font-size:10px;font-weight:600;display:inline-flex;align-items:center;justify-content:center;flex:none}
+.lock{min-height:100vh;display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;padding:24px;gap:6px}.lock b{font-size:48px}.lock h2{margin:8px 0 0}.lock p{color:var(--hint);margin:0;max-width:320px}
 .mem{display:flex;align-items:center;gap:10px;padding:6px 0}
 .mem .av{width:30px;height:30px;font-size:14px}
 .pos{color:var(--green)} .negc{color:var(--red)} .planc{color:var(--plan)}
@@ -153,7 +154,7 @@ input[type=range]:focus-visible{outline:2px solid var(--accent);outline-offset:4
 .crow .top .nm{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .crow .meta{display:flex;justify-content:space-between;font-size:12px;color:var(--hint);margin-top:4px}
 .up{color:var(--red)} .down{color:var(--green)}
-.dot-move{background:var(--accent)} .movec{color:var(--accent)}
+.dot-priv{background:var(--hint)} .dot-move{background:var(--accent)} .movec{color:var(--accent)}
 .emojis{display:flex;flex-wrap:wrap;gap:6px;margin:-4px 0 12px}
 .emojis button{font-size:22px;width:42px;height:42px;border:0;border-radius:10px;background:var(--bg2);cursor:pointer}
 .emojis button.on{outline:2px solid var(--accent);outline-offset:-2px}
@@ -371,6 +372,7 @@ let saveTimer = null, saveChain = Promise.resolve();
 function saveState(){
   if (LOAD_FAILED) return;
   if (SHARED) stampAuthors();
+  savePriv();
   clearTimeout(saveTimer);
   // Сохранения выстраиваются в очередь, чтобы две записи не писали в один слот одновременно
   saveTimer = setTimeout(() => { saveChain = saveChain.then(writeState); }, 300);
@@ -411,6 +413,7 @@ async function loadFailed(){
 const URLQ = new URLSearchParams(location.search);
 const API = (URLQ.get('api') || '').replace(/\/+$/, '');
 const JOIN = URLQ.get('join');
+let LOCKED = false;   // сервер ответил 403: этого пользователя нет в списке допущенных
 let SHARED = false, REV = 0, SYNCED = '', MEMBERS = [], ME = 0, writing = false;
 const flag = {   // «этот пользователь в общем календаре» — чтобы при недоступном сервере не открыть личный
   get(){ try { return localStorage.getItem('money_shared') === '1'; } catch(e){ return false; } },
@@ -437,15 +440,73 @@ async function loadShared(){
       }
       try { history.replaceState(null, '', location.pathname + '?api=' + encodeURIComponent(API)); } catch(e){}
     }
+    if (r.status === 403){ LOCKED = true; LOAD_FAILED = true; return null; }
     if (r.status !== 200) throw new Error('api ' + r.status);
     if (!r.data.member){ flag.set(false); return undefined; }
     enterShared(r.data); SYNCED = JSON.stringify(r.data.state);
+    await loadPriv();
     return r.data.state;
   } catch(e){
     console.error(e);
     if (flag.get()){ LOAD_FAILED = true; return null; }
     return undefined;
   }
+}
+
+function lockScreen(){
+  document.body.innerHTML = '<div class="lock"><b>🔒</b><h2>Закрытый бот</h2><p>Это приложение доступно только приглашённым пользователям.</p></div>';
+}
+
+/* ---------- Личные (инкогнито) записи ----------
+   Лежат только в облаке Telegram самого пользователя (ключи с префиксами pa, pb и pptr: те же два слота, что у основных данных)
+   и НИКОГДА не попадают в S, а значит, и на сервер. Вне Telegram — localStorage['money_priv'].
+   Они не меняют общий остаток: это траты и доходы личного счёта 'me'. */
+let PRIV = { v: 1, ops: [] }, PRIV_SAVED = '', PRIV_FAILED = false, privActive = null, privSize = { a: 0, b: 0 };
+const allOps = () => [...S.ops, ...PRIV.ops];
+async function loadPriv(){
+  PRIV = { v: 1, ops: [] }; PRIV_SAVED = '';
+  try {
+    let st = null;
+    if (!useCloud()){ const raw = localStorage.getItem('money_priv'); st = raw ? JSON.parse(raw) : null; }
+    else {
+      const meta = await cs('getItems', ['pptr', 'pa_n', 'pb_n']);
+      const info = {};
+      for (const sl of SLOTS){ const [n, len] = String(meta['p' + sl + '_n'] || '').split('|').map(Number); info[sl] = { n: n || 0, len: len || 0 }; privSize[sl] = n || 0; }
+      if (SLOTS.includes(meta.pptr)){
+        for (const sl of [meta.pptr, otherSlot(meta.pptr)]){
+          st = await readChunks('p' + sl, info[sl].n, info[sl].len);
+          if (st){ privActive = sl; break; }
+        }
+        if (!st) throw new Error('private data unreadable');   // данные есть, но не читаются — не затираем
+      }
+    }
+    if (st && Array.isArray(st.ops)){ PRIV = st; PRIV_SAVED = JSON.stringify(PRIV); }
+  } catch(e){ console.error(e); PRIV_FAILED = true; toast('Не удалось загрузить личные записи. Они не изменятся.'); }
+}
+let privTimer = null, privChain = Promise.resolve();
+function savePriv(){
+  if (!SHARED || PRIV_FAILED) return;
+  clearTimeout(privTimer);
+  privTimer = setTimeout(() => {
+    const json = JSON.stringify(PRIV);
+    if (json !== PRIV_SAVED) privChain = privChain.then(() => writePriv(json));
+  }, 300);
+}
+async function writePriv(json){
+  try {
+    if (!useCloud()){ localStorage.setItem('money_priv', json); PRIV_SAVED = json; return; }
+    const slot = privActive ? otherSlot(privActive) : 'a', pre = 'p' + slot, parts = [];
+    for (let i = 0; i < json.length; i += CHUNK) parts.push(json.slice(i, i + CHUNK));
+    await cs('setItem', pre + '_n', '0');
+    await Promise.all(parts.map((p, i) => cs('setItem', pre + '_' + i, p)));
+    await cs('setItem', pre + '_n', parts.length + '|' + json.length);
+    await cs('setItem', 'pptr', slot);
+    privActive = slot; PRIV_SAVED = json;
+    const stale = [];
+    for (let i = parts.length; i < privSize[slot]; i++) stale.push(pre + '_' + i);
+    privSize[slot] = parts.length;
+    if (stale.length) await cs('removeItems', stale).catch(console.error);
+  } catch(e){ console.error(e); toast('Не удалось сохранить личные записи. Проверьте интернет.'); }
 }
 
 // Трёхстороннее слияние по id: base — версия, с которой я начал, mine — моя, theirs — на сервере.
@@ -653,19 +714,19 @@ async function changeBase(nb){
   if (mode !== 'conv' && mode !== 'label'){ renderMore(); return; }
   const t = today();
   // Зафиксированные курсы валютных операций — рыночный факт, их переводим в новую валюту в любом случае
-  for (const op of S.ops) if (op.cur && op.rate) op.rate *= k;
+  for (const op of allOps()) if (op.cur && op.rate) op.rate *= k;
   if (mode === 'conv'){
     // Суммы без валюты были в старой основной — делаем это явным, и они пересчитаются в новую
     S.start.balance *= k;
-    for (const op of S.ops) if (!op.cur){ op.cur = ob; if (op.date <= t) op.rate = k; }
+    for (const op of allOps()) if (!op.cur){ op.cur = ob; if (op.date <= t) op.rate = k; }
     for (const r of S.rules) for (const v of r.v){ if (!v.cur && !v.stop) v.cur = ob; if (v.util && !v.ucur) v.ucur = ob; }
     for (const o of Object.values(S.ov)){ if (o.amount != null && !o.cur) o.cur = ob; if (o.util && !o.ucur) o.ucur = ob; }
   }
   // Суммы, которые и так были в новой валюте, становятся «основными»
-  for (const op of S.ops) if (op.cur === nb){ delete op.cur; delete op.rate; delete op.rdate; }
+  for (const op of allOps()) if (op.cur === nb){ delete op.cur; delete op.rate; delete op.rdate; }
   for (const r of S.rules) for (const v of r.v){ if (v.cur === nb) delete v.cur; if (v.ucur === nb) delete v.ucur; }
   for (const o of Object.values(S.ov)){ if (o.cur === nb) delete o.cur; if (o.ucur === nb) delete o.ucur; }
-  for (const op of S.ops) if (op.cur) delete op.rdate;   // курс на дату уточнится уже к новой валюте
+  for (const op of allOps()) if (op.cur) delete op.rdate;   // курс на дату уточнится уже к новой валюте
   S.settings.base = nb;
   haptic('success'); commit(); toast('Основная валюта: ' + nb);
   freezeOps();
@@ -680,7 +741,7 @@ async function freezeOps(){
   freezing = true;
   try {
     const t = today(); let changed = false;
-    const todo = S.ops.filter(op => op.cur && op.cur !== BASE && op.date <= t && op.rdate !== op.date);
+    const todo = allOps().filter(op => op.cur && op.cur !== BASE && op.date <= t && op.rdate !== op.date);
     for (const op of todo) if (!op.rate && rateOf(op.cur)){ op.rate = rateOf(op.cur); changed = true; }
     // не больше 30 дат за раз, чтобы не заваливать API запросами; остальные — при следующем запуске
     for (const d of [...new Set(todo.map(op => op.date))].slice(0, 30)){
@@ -712,15 +773,19 @@ async function refreshRates(force){
 const ACC_ICONS = ['🏖','🏠','🚗','✈️','🎁','💍','🎓','🩺','📱','💻','🛋','👶','🐶','🎮','🐷','🛟'];
 const accList = all => (S.accounts || []).filter(a => all || !a.archived);
 const accById = id => (S.accounts || []).find(a => a.id === id);
-const accLabel = id => id === 'main' ? '💳 Основной' : id === 'ext' ? '➕ Извне' : (a => a ? a.icon + ' ' + a.name : '❔ Удалённый счёт')(accById(id));
+// 'me' — личный счёт того, кто сделал запись (by). Перевод на него виден обоим, траты с него (инкогнито) — только владельцу
+const meLabel = by => '🕶️ Личный' + (by && by !== ME ? ' (' + ((MEMBERS.find(m => m.id === by) || {}).name || '').split(' ')[0] + ')' : '');
+const accLabel = (id, by) => id === 'main' ? '💳 Основной' : id === 'ext' ? '➕ Извне' : id === 'me' ? meLabel(by) : (a => a ? a.icon + ' ' + a.name : '❔ Удалённый счёт')(accById(id));
 const isMove = e => e.op && e.op.cat === 'move';
 const moveBase = op => toBase(op.amount, op.cur, op.rate);
 // Остаток счёта на конец дня d (skip — операцию не учитывать, нужно при её правке)
 function accBal(id, d, skip){
   let b = 0;
   for (const op of S.ops) if (op.cat === 'move' && op !== skip && op.date <= d){
+    if (id === 'me' && op.by !== ME) continue;       // переводы на чужой личный счёт — не мои
     const v = moveBase(op); if (op.to === id) b += v; if (op.from === id) b -= v;
   }
+  if (id === 'me') for (const op of PRIV.ops) if (op !== skip && op.date <= d) b += toBase(op.amount, op.cur, op.rate);
   return b;
 }
 const firstGrapheme = s => {
@@ -787,9 +852,11 @@ function rebuild(){
       push({ date: op.date, amount: (op.to === 'main' ? v : 0) - (op.from === 'main' ? v : 0), move: v, op });
     } else push({ date: op.date, amount: toBase(op.amount, op.cur, op.rate), op });
   }
+  // Личные записи только показываются в календаре (priv) и не влияют на общий остаток
+  if (SHARED) for (const op of PRIV.ops) push({ date: op.date, amount: toBase(op.amount, op.cur, op.rate), op, priv: true });
   let b = S.start.balance, cur = S.start.date;
   while (cur <= to){
-    for (const e of EV.get(cur) || []) if (counts(e)) b += e.amount;
+    for (const e of EV.get(cur) || []) if (!e.priv && counts(e)) b += e.amount;
     BAL.set(cur, b);
     cur = addDays(cur, 1);
   }
@@ -864,7 +931,7 @@ function renderCalendar(){
   for (let i = 0; i < first; i++) html += '<div class="cell empty"></div>';
   for (let d = 1; d <= n; d++){
     const ds = `${y}-${pad(m+1)}-${pad(d)}`;
-    const b = balOn(ds), ev = EV.get(ds) || [];
+    const b = balOn(ds), all = EV.get(ds) || [], ev = all.filter(e => !e.priv), pv = all.some(e => e.priv);
     const inc = ev.some(e => e.amount > 0 && !isMove(e)), out = ev.some(e => e.amount < 0 && !isMove(e) && !(e.op && e.op.cat === 'plan')), plan = ev.some(e => e.op && e.op.cat === 'plan'), mv = ev.some(isMove);
     const cls = ['cell'];
     if (ds === t) cls.push('today'); if (ds === SEL) cls.push('sel'); if (ds < t) cls.push('past');
@@ -872,7 +939,7 @@ function renderCalendar(){
     const lvl = b != null && b > 0 ? Math.min(100, b / max * 100) : 0;
     html += `<button class="${cls.join(' ')}" data-d="${ds}" style="--lvl:${lvl}%" aria-label="${fmtDate(ds)}${b!=null?', остаток '+fmtMoney(b):''}">
       <span class="d">${d}</span>
-      <span class="dots">${inc?'<i class="dot-in"></i>':''}${out?'<i class="dot-out"></i>':''}${plan?'<i class="dot-plan"></i>':''}${mv?'<i class="dot-move"></i>':''}</span>
+      <span class="dots">${inc?'<i class="dot-in"></i>':''}${out?'<i class="dot-out"></i>':''}${plan?'<i class="dot-plan"></i>':''}${mv?'<i class="dot-move"></i>':''}${pv?'<i class="dot-priv"></i>':''}</span>
       <span class="b num">${b != null ? compact(b) : ''}</span>
       <span class="gauge"></span></button>`;
   }
@@ -882,10 +949,10 @@ function renderCalendar(){
 function eventRow(e, i){
   if (isMove(e)){
     const o = e.op, toA = accById(o.to), fromA = accById(o.from);
-    const icon = o.to !== 'main' && toA ? toA.icon : fromA ? fromA.icon : '🔁';
+    const icon = o.to === 'me' || o.from === 'me' ? '🕶️' : o.to !== 'main' && toA ? toA.icon : fromA ? fromA.icon : '🔁';
     const sub = [o.note, o.cur && o.cur !== BASE ? fmtCur(o.amount, o.cur) : ''].filter(Boolean).join(' · ');
     return `<li class="row" data-ev="${i}"><span class="ic">${esc(icon)}</span>
-      <span class="t">${esc(accLabel(o.from))} → ${esc(accLabel(o.to))}${who(o)}<small>${sub ? esc(sub) : 'перевод между счетами'}</small></span>
+      <span class="t">${esc(accLabel(o.from, o.by))} → ${esc(accLabel(o.to, o.by))}${who(o)}<small>${sub ? esc(sub) : 'перевод между счетами'}</small></span>
       <span class="a num movec">${e.amount ? fmtSigned(e.amount) : fmtMoney(e.move)}</span></li>`;
   }
   if (e.rule){
@@ -898,12 +965,12 @@ function eventRow(e, i){
   const isPlan = e.op.cat === 'plan';
   const sub = [e.op.note ? c.n : '', e.op.cur && e.op.cur !== BASE ? fmtCur(Math.abs(e.op.amount), e.op.cur) + (e.op.rdate ? ' по курсу НБРБ ' + fmtNum(e.op.rate, 4) : ' по текущему курсу') : ''].filter(Boolean).join(' · ');
   return `<li class="row" data-ev="${i}"><span class="ic">${c.i}</span>
-    <span class="t">${esc(e.op.note || c.n)}${who(e.op)}${sub ? `<small>${sub}</small>` : ''}</span>
+    <span class="t">${esc(e.op.note || c.n)}${e.priv ? '<span class="by">🕶️ инкогнито</span>' : who(e.op)}${sub ? `<small>${sub}</small>` : ''}</span>
     <span class="a num ${isPlan ? 'planc' : e.amount > 0 ? 'pos' : 'negc'}">${fmtSigned(e.amount)}</span></li>`;
 }
 function renderDay(){
   const ev = EV.get(SEL) || [], b = balOn(SEL);
-  const spent = ev.filter(e => e.op && !isMove(e) && e.amount < 0).reduce((s, e) => s - e.amount, 0);
+  const spent = ev.filter(e => e.op && !e.priv && !isMove(e) && e.amount < 0).reduce((s, e) => s - e.amount, 0);
   $('day').innerHTML = `
     <h3>${fmtDate(SEL, {weekday:'long', day:'numeric', month:'long'})}</h3>
     <div class="bal num">${b != null ? 'На конец дня: ' + fmtMoney(b) : 'До начала учёта'}${spent ? ' · потрачено ' + fmtMoney(spent) : ''}</div>
@@ -911,7 +978,7 @@ function renderDay(){
     <div class="actions">
       <button class="btn" id="addOut">− Расход</button>
       <button class="btn soft" id="addIn">+ Доход</button>
-      ${accList().length ? '<button class="btn soft" id="addMove">⇄ Перевод</button>' : ''}
+      ${accList().length || SHARED ? '<button class="btn soft" id="addMove">⇄ Перевод</button>' : ''}
     </div>`;
   $('day').querySelectorAll('[data-ev]').forEach(el => el.onclick = () => {
     const e = ev[+el.dataset.ev];
@@ -926,7 +993,7 @@ function renderDay(){
 // Остатки показываются на дату, выбранную ползунком (шапка с ползунком видна на всех вкладках)
 function renderAccs(){
   const list = accList(), main = balOn(SEL), t = today();
-  const total = (main || 0) + list.reduce((s, a) => s + accBal(a.id, SEL), 0);
+  const total = (main || 0) + list.reduce((s, a) => s + accBal(a.id, SEL), 0) + (SHARED ? accBal('me', SEL) : 0);
   const when = SEL === t ? 'сегодня' : 'на ' + fmtDate(SEL, {day:'numeric', month:'long', year:'numeric'});
   const row = (id, icon, name, bal, sub) => `<li class="row" data-acc="${id}"><span class="ic">${esc(icon)}</span>
     <span class="t">${esc(name)}${sub ? `<small>${sub}</small>` : ''}</span>
@@ -936,17 +1003,19 @@ function renderAccs(){
     <div class="totals"><div><span class="hint">Всего с накоплениями</span><b class="num">${fmtMoney(total)}</b></div></div>
     <div class="card"><ul class="list" style="margin:0">
       ${row('main', '💳', 'Основной', main || 0, 'зарплата, расходы и прогноз')}
+      ${SHARED ? row('me', '🕶️', 'Личный счёт', accBal('me', SEL), 'видите только вы') : ''}
       ${list.map(a => row(a.id, a.icon, a.name, accBal(a.id, SEL))).join('')}
     </ul></div>
     ${list.length ? '' : '<p class="empty-note" style="margin:0 0 12px">Создайте счёт для накоплений — например, «🏖 Отпуск» или «🏠 Квартира» — и переводите туда деньги с основного.</p>'}
     <div class="actions">
       <button class="btn" id="accAdd">＋ Новый счёт</button>
-      ${list.length ? '<button class="btn soft" id="accMove">⇄ Перевод</button>' : ''}
+      ${list.length || SHARED ? '<button class="btn soft" id="accMove">⇄ Перевод</button>' : ''}
     </div>
     <p class="hint">Переводы между счетами не считаются расходами. Сдвиньте ползунок, чтобы увидеть остатки на будущую дату с учётом запланированных переводов.</p>`;
   $('tab-accs').querySelectorAll('[data-acc]').forEach(el => el.onclick = () => {
     haptic();
-    if (el.dataset.acc === 'main') return list.length ? editMove(null, { from: 'main' }) : editAccount(null);
+    if (el.dataset.acc === 'me') return personalSheet();
+    if (el.dataset.acc === 'main') return list.length || SHARED ? editMove(null, { from: 'main' }) : editAccount(null);
     accountSheet(accById(el.dataset.acc));
   });
   $('accAdd').onclick = () => editAccount(null);
@@ -1008,6 +1077,7 @@ function monthStats(y, m){
   EV.forEach((list, d) => {
     if (!d.startsWith(prefix)) return;
     for (const e of list){
+      if (e.priv) continue;                                  // личные траты в общую статистику не входят
       if (isMove(e)){ r.saved -= e.amount; continue; }      // с основного на копилки — «отложено»
       if (e.amount > 0){ r.inc += e.amount; continue; }
       const k = statKey(e), v = -e.amount;
@@ -1232,7 +1302,7 @@ function renderMore(){
   $('shift').onchange = e => { S.settings.shift = e.target.checked; commit(); };
   $('reset').onclick = async () => {
     if (!(await ask(SHARED ? 'Удалить все данные общего календаря у обоих участников? Это нельзя отменить.' : 'Удалить все данные? Это нельзя отменить.'))) return;
-    LOAD_FAILED = false; S = blankState(); commit(); onboarding();
+    LOAD_FAILED = false; S = blankState(); if (SHARED) PRIV = { v: 1, ops: [] }; commit(); onboarding();
   };
 }
 
@@ -1272,7 +1342,8 @@ function sortedExpenseCats(keep){
 }
 function editOp(op, sign, draft){
   const isNew = !op; sign = op ? Math.sign(op.amount) : sign;
-  const d = draft || (op ? { amount: Math.abs(op.amount), cur: op.cur, cat: op.cat, date: op.date, note: op.note } : {});
+  const wasPriv = !!op && PRIV.ops.includes(op);
+  const d = draft || (op ? { amount: Math.abs(op.amount), cur: op.cur, cat: op.cat, date: op.date, note: op.note, inc: wasPriv } : {});
   const cats = sign < 0 ? sortedExpenseCats(d.cat) : Object.entries(INCOME_CATS);
   const cur = d.cat || cats[0][0];
   openSheet(`
@@ -1283,13 +1354,14 @@ function editOp(op, sign, draft){
       <label class="field"><span>Дата</span><input id="f_d" type="date" value="${d.date || SEL}"></label>
       <label class="field"><span>Комментарий</span><input id="f_n" value="${esc(d.note || '')}" placeholder="необязательно"></label>
     </div>
+    ${SHARED ? `<label class="switch"><span>🕶️ Инкогнито<br><small class="hint">Видно только вам, считается с личного счёта, общий остаток не меняется</small></span><input type="checkbox" id="f_inc" ${d.inc ? 'checked' : ''}></label>` : ''}
     <button class="btn block" id="f_save">${isNew ? 'Добавить' : 'Сохранить'}</button>
     ${isNew ? '' : '<button class="btn danger block" id="f_del">Удалить</button>'}`,
   b => {
     // «＋ Своя»: создаём категорию и возвращаемся в эту же форму с уже введёнными данными
     const nc = b.querySelector('#f_newcat');
     if (nc) nc.onclick = () => {
-      const keep = { amount: b.querySelector('#f_a').value, cur: b.querySelector('#f_a_c').value, date: b.querySelector('#f_d').value, note: b.querySelector('#f_n').value };
+      const keep = { amount: b.querySelector('#f_a').value, cur: b.querySelector('#f_a_c').value, date: b.querySelector('#f_d').value, note: b.querySelector('#f_n').value, inc: !!(b.querySelector('#f_inc') || {}).checked };
       editCat(null, id => editOp(op, sign, { ...keep, cat: id }));
     };
     b.querySelector('#f_save').onclick = () => {
@@ -1304,12 +1376,45 @@ function editOp(op, sign, draft){
       const rate = cy === BASE || date > today() ? undefined : same ? op.rate : rateOf(cy);
       const rdate = same ? op.rdate : undefined;
       const data = { date, amount: sign * a, cat: b.querySelector('input[name=cat]:checked').value, note: b.querySelector('#f_n').value.trim(), cur: cy === BASE ? undefined : cy, rate, rdate };
-      if (isNew) S.ops.push({ id: uid(), ts: Date.now(), ...data }); else Object.assign(op, data);
+      const inc = SHARED && !!(b.querySelector('#f_inc') || {}).checked;
+      if (isNew) (inc ? PRIV : S).ops.push({ id: uid(), ts: Date.now(), ...data });
+      else if (inc === wasPriv) Object.assign(op, data);
+      else {   // запись перенесли между общими и личными
+        (wasPriv ? PRIV : S).ops = (wasPriv ? PRIV : S).ops.filter(o => o !== op);
+        (inc ? PRIV : S).ops.push({ id: op.id, ts: op.ts, ...data });
+      }
       haptic('success'); closeSheet(); commit(); selectDate(data.date);
       if (data.cur) freezeOps();
     };
     const del = b.querySelector('#f_del');
-    if (del) del.onclick = () => { S.ops = S.ops.filter(o => o !== op); closeSheet(); commit(); };
+    if (del) del.onclick = () => { S.ops = S.ops.filter(o => o !== op); PRIV.ops = PRIV.ops.filter(o => o !== op); closeSheet(); commit(); };
+  });
+}
+
+/* Личный счёт: баланс, переводы с общего и обратно, личные траты */
+function personalSheet(){
+  const t = today();
+  const items = [
+    ...S.ops.filter(op => op.cat === 'move' && (op.from === 'me' || op.to === 'me') && op.by === ME).map(op => ({ op, move: true })),
+    ...PRIV.ops.map(op => ({ op })),
+  ].sort((x, y) => y.op.date.localeCompare(x.op.date) || (y.op.ts || 0) - (x.op.ts || 0));
+  openSheet(`
+    <h2>🕶️ Личный счёт</h2>
+    <p class="hint" style="margin:-6px 0 12px">${SEL === t ? 'Сейчас' : 'На ' + fmtDate(SEL, {day:'numeric', month:'long', year:'numeric'})}: <b class="num">${fmtMoney(accBal('me', SEL))}</b><br>Переводы с общего счёта на личный видны второму участнику, траты с личного (инкогнито) — нет.</p>
+    <div class="actions" style="margin:0 0 4px"><button class="btn" id="p_in">＋ Перевести с общего</button><button class="btn soft" id="p_out">Вернуть на общий</button></div>
+    ${items.length ? `<ul class="list">${items.slice(0, 60).map((it, i) => {
+      const op = it.op;
+      if (it.move){
+        const inn = op.to === 'me';
+        return `<li class="row" data-h="${i}"><span class="t">${fmtDate(op.date, {day:'numeric', month:'long', year:'numeric'})}${op.date > t ? ' · план' : ''}<small>${inn ? 'с общего счёта' : 'на общий счёт'}${op.note ? ' · ' + esc(op.note) : ''}</small></span><span class="a num ${inn ? 'pos' : 'negc'}">${inn ? '+' : '−'}${fmtMoney(moveBase(op))}</span></li>`;
+      }
+      const v = toBase(op.amount, op.cur, op.rate), c = v > 0 ? (INCOME_CATS[op.cat] || INCOME_CATS.inc) : catOf(op.cat);
+      return `<li class="row" data-h="${i}"><span class="ic">${esc(c.i)}</span><span class="t">${esc(op.note || c.n)}<small>${fmtDate(op.date, {day:'numeric', month:'long', year:'numeric'})}${op.date > t ? ' · план' : ''}</small></span><span class="a num ${v > 0 ? 'pos' : 'negc'}">${fmtSigned(v)}</span></li>`;
+    }).join('')}</ul>` : '<p class="empty-note">Пока пусто. Переведите деньги с общего счёта и отмечайте траты переключателем «🕶️ Инкогнито».</p>'}`,
+  b => {
+    b.querySelector('#p_in').onclick = () => editMove(null, { from: 'main', to: 'me' });
+    b.querySelector('#p_out').onclick = () => editMove(null, { from: 'me', to: 'main' });
+    b.querySelectorAll('[data-h]').forEach(el => el.onclick = () => { const it = items[+el.dataset.h]; it.move ? editMove(it.op) : editOp(it.op); });
   });
 }
 
@@ -1382,9 +1487,10 @@ async function deleteAccount(a){
 }
 
 function editMove(op, preset){
-  const o = op || { from: 'main', to: (accList()[0] || {}).id, date: SEL, ...preset };
-  const ids = sel => [...new Set(['main', ...accList().map(a => a.id), ...(sel ? [sel] : [])])];
-  const opts = sel => ids(sel).map(id => `<option value="${id}" ${id === sel ? 'selected' : ''}>${esc(accLabel(id))}</option>`).join('');
+  if (op && (op.from === 'me' || op.to === 'me') && op.by && op.by !== ME) return toast('Чужой личный перевод менять нельзя');
+  const o = op || { from: 'main', to: (accList()[0] || {}).id || (SHARED ? 'me' : undefined), date: SEL, ...preset };
+  const ids = sel => [...new Set(['main', ...(SHARED ? ['me'] : []), ...accList().map(a => a.id), ...(sel ? [sel] : [])])];
+  const opts = sel => ids(sel).map(id => `<option value="${id}" ${id === sel ? 'selected' : ''}>${esc(accLabel(id, ME))}</option>`).join('');
   openSheet(`
     <h2>${op ? 'Перевод' : 'Новый перевод'}</h2>
     <div class="two">
@@ -1411,7 +1517,7 @@ function editMove(op, preset){
       // со счёта-копилки нельзя незаметно снять больше, чем на нём есть
       if (from !== 'main' && from !== 'ext'){
         const left = accBal(from, date, op) - toBase(a, cy, rate);
-        if (left < -0.005 && !(await ask(`На счёте ${accLabel(from)} не хватит денег: останется ${fmtMoney(left)}. Всё равно перевести?`))) return;
+        if (left < -0.005 && !(await ask(`На счёте ${accLabel(from, ME)} не хватит денег: останется ${fmtMoney(left)}. Всё равно перевести?`))) return;
       }
       const data = { date, cat: 'move', from, to, amount: a, note, cur: cy === BASE ? undefined : cy, rate, rdate };
       if (op) Object.assign(op, data); else S.ops.push({ id: uid(), ts: Date.now(), ...data });
@@ -1604,6 +1710,7 @@ $('tabs').onclick = e => { const b = e.target.closest('[data-tab]'); if (b){ hap
 /* ================== Старт ================== */
 (async () => {
   const loaded = await loadState();
+  if (LOCKED){ lockScreen(); return; }
   S = normalizeState(loaded && loaded.v ? loaded : blankState());
   BASE = S.settings.base;
   setSliderFill();
