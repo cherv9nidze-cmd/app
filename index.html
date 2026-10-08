@@ -457,14 +457,15 @@ function lockScreen(){
   document.body.innerHTML = '<div class="lock"><b>🔒</b><h2>Закрытый бот</h2><p>Это приложение доступно только приглашённым пользователям.</p></div>';
 }
 
-/* ---------- Личные (инкогнито) записи ----------
+/* ---------- Личные (инкогнито) записи и личные копилки ----------
    Лежат только в облаке Telegram самого пользователя (ключи с префиксами pa, pb и pptr: те же два слота, что у основных данных)
    и НИКОГДА не попадают в S, а значит, и на сервер. Вне Telegram — localStorage['money_priv'].
-   Они не меняют общий остаток: это траты и доходы личного счёта 'me'. */
-let PRIV = { v: 1, ops: [] }, PRIV_SAVED = '', PRIV_FAILED = false, privActive = null, privSize = { a: 0, b: 0 };
+   Они не меняют общий остаток: это траты и доходы личного счёта 'me'. Личные копилки (PRIV.accounts) и переводы
+   между личными счетами (PRIV.ops с cat:'move') тоже здесь. */
+let PRIV = { v: 1, ops: [], accounts: [] }, PRIV_SAVED = '', PRIV_FAILED = false, privActive = null, privSize = { a: 0, b: 0 };
 const allOps = () => [...S.ops, ...PRIV.ops];
 async function loadPriv(){
-  PRIV = { v: 1, ops: [] }; PRIV_SAVED = '';
+  PRIV = { v: 1, ops: [], accounts: [] }; PRIV_SAVED = '';
   try {
     let st = null;
     if (!useCloud()){ const raw = localStorage.getItem('money_priv'); st = raw ? JSON.parse(raw) : null; }
@@ -480,7 +481,7 @@ async function loadPriv(){
         if (!st) throw new Error('private data unreadable');   // данные есть, но не читаются — не затираем
       }
     }
-    if (st && Array.isArray(st.ops)){ PRIV = st; PRIV_SAVED = JSON.stringify(PRIV); }
+    if (st && Array.isArray(st.ops)){ PRIV = st; PRIV.accounts = PRIV.accounts || []; PRIV_SAVED = JSON.stringify(PRIV); }
   } catch(e){ console.error(e); PRIV_FAILED = true; toast('Не удалось загрузить личные записи. Они не изменятся.'); }
 }
 let privTimer = null, privChain = Promise.resolve();
@@ -771,21 +772,30 @@ async function refreshRates(force){
 // остаток и прогноз в шапке. Перевод — операция cat:'move' с полями from/to: 'main', id счёта или 'ext'
 // (деньги извне — например, уже отложенное при создании счёта). Перевод не считается ни расходом, ни доходом.
 const ACC_ICONS = ['🏖','🏠','🚗','✈️','🎁','💍','🎓','🩺','📱','💻','🛋','👶','🐶','🎮','🐷','🛟'];
-const accList = all => (S.accounts || []).filter(a => all || !a.archived);
-const accById = id => (S.accounts || []).find(a => a.id === id);
+// Копилки: общие (S.accounts) и мои личные (PRIV.accounts, видны только мне). Личный счёт 'me' и личные копилки —
+// «личная сторона». Перевод целиком между личными сторонами (или 'ext') хранится в PRIV и партнёру не виден;
+// перевод между личной и общей стороной лежит в S.ops: партнёр видит сумму и «Личный (Имя)», но не название копилки.
+const allAccs = () => [...(S.accounts || []), ...(PRIV.accounts || [])];
+const accList = all => allAccs().filter(a => all || !a.archived);
+const accById = id => allAccs().find(a => a.id === id);
+const privSide = id => id === 'me' || (PRIV.accounts || []).some(a => a.id === id);
+const isPrivMove = (from, to) => (privSide(from) || privSide(to)) && [from, to].every(x => privSide(x) || x === 'ext');
+const pushMove = op => (isPrivMove(op.from, op.to) ? PRIV : S).ops.push(op);
+const foreignPriv = op => !!op.by && op.by !== ME && [op.from, op.to].some(id => id === 'me' || (id !== 'main' && id !== 'ext' && !accById(id)));
 // 'me' — личный счёт того, кто сделал запись (by). Перевод на него виден обоим, траты с него (инкогнито) — только владельцу
 const meLabel = by => '🕶️ Личный' + (by && by !== ME ? ' (' + ((MEMBERS.find(m => m.id === by) || {}).name || '').split(' ')[0] + ')' : '');
-const accLabel = (id, by) => id === 'main' ? '💳 Основной' : id === 'ext' ? '➕ Извне' : id === 'me' ? meLabel(by) : (a => a ? a.icon + ' ' + a.name : '❔ Удалённый счёт')(accById(id));
+const accLabel = (id, by) => id === 'main' ? '💳 Основной' : id === 'ext' ? '➕ Извне' : id === 'me' ? meLabel(by) : (a => a ? a.icon + ' ' + a.name : by && by !== ME ? meLabel(by) : '❔ Удалённый счёт')(accById(id));
 const isMove = e => e.op && e.op.cat === 'move';
 const moveBase = op => toBase(op.amount, op.cur, op.rate);
 // Остаток счёта на конец дня d (skip — операцию не учитывать, нужно при её правке)
 function accBal(id, d, skip){
   let b = 0;
-  for (const op of S.ops) if (op.cat === 'move' && op !== skip && op.date <= d){
-    if (id === 'me' && op.by !== ME) continue;       // переводы на чужой личный счёт — не мои
-    const v = moveBase(op); if (op.to === id) b += v; if (op.from === id) b -= v;
+  const add = op => { if (op.cat === 'move' && op !== skip && op.date <= d){ const v = moveBase(op); if (op.to === id) b += v; if (op.from === id) b -= v; } };
+  for (const op of S.ops){ if (id === 'me' && op.by !== ME) continue; add(op); }   // переводы на чужой личный счёт — не мои
+  for (const op of PRIV.ops){
+    add(op);
+    if (id === 'me' && op.cat !== 'move' && op !== skip && op.date <= d) b += toBase(op.amount, op.cur, op.rate);
   }
-  if (id === 'me') for (const op of PRIV.ops) if (op !== skip && op.date <= d) b += toBase(op.amount, op.cur, op.rate);
   return b;
 }
 const firstGrapheme = s => {
@@ -853,7 +863,10 @@ function rebuild(){
     } else push({ date: op.date, amount: toBase(op.amount, op.cur, op.rate), op });
   }
   // Личные записи только показываются в календаре (priv) и не влияют на общий остаток
-  if (SHARED) for (const op of PRIV.ops) push({ date: op.date, amount: toBase(op.amount, op.cur, op.rate), op, priv: true });
+  if (SHARED) for (const op of PRIV.ops){
+    if (op.cat === 'move') push({ date: op.date, amount: 0, move: moveBase(op), op, priv: true });
+    else push({ date: op.date, amount: toBase(op.amount, op.cur, op.rate), op, priv: true });
+  }
   let b = S.start.balance, cur = S.start.date;
   while (cur <= to){
     for (const e of EV.get(cur) || []) if (!e.priv && counts(e)) b += e.amount;
@@ -949,10 +962,11 @@ function renderCalendar(){
 function eventRow(e, i){
   if (isMove(e)){
     const o = e.op, toA = accById(o.to), fromA = accById(o.from);
-    const icon = o.to === 'me' || o.from === 'me' ? '🕶️' : o.to !== 'main' && toA ? toA.icon : fromA ? fromA.icon : '🔁';
+    const unk = id => id !== 'main' && id !== 'ext' && id !== 'me' && !accById(id);
+    const icon = o.to === 'me' || o.from === 'me' || unk(o.to) || unk(o.from) ? '🕶️' : o.to !== 'main' && toA ? toA.icon : fromA ? fromA.icon : '🔁';
     const sub = [o.note, o.cur && o.cur !== BASE ? fmtCur(o.amount, o.cur) : ''].filter(Boolean).join(' · ');
     return `<li class="row" data-ev="${i}"><span class="ic">${esc(icon)}</span>
-      <span class="t">${esc(accLabel(o.from, o.by))} → ${esc(accLabel(o.to, o.by))}${who(o)}<small>${sub ? esc(sub) : 'перевод между счетами'}</small></span>
+      <span class="t">${esc(accLabel(o.from, o.by))} → ${esc(accLabel(o.to, o.by))}${e.priv ? '<span class="by">🕶️ инкогнито</span>' : who(o)}<small>${sub ? esc(sub) : 'перевод между счетами'}</small></span>
       <span class="a num movec">${e.amount ? fmtSigned(e.amount) : fmtMoney(e.move)}</span></li>`;
   }
   if (e.rule){
@@ -1004,7 +1018,7 @@ function renderAccs(){
     <div class="card"><ul class="list" style="margin:0">
       ${row('main', '💳', 'Основной', main || 0, 'зарплата, расходы и прогноз')}
       ${SHARED ? row('me', '🕶️', 'Личный счёт', accBal('me', SEL), 'видите только вы') : ''}
-      ${list.map(a => row(a.id, a.icon, a.name, accBal(a.id, SEL))).join('')}
+      ${list.map(a => row(a.id, a.icon, a.name, accBal(a.id, SEL), (PRIV.accounts || []).includes(a) ? '🕶️ личная, видите только вы' : '')).join('')}
     </ul></div>
     ${list.length ? '' : '<p class="empty-note" style="margin:0 0 12px">Создайте счёт для накоплений — например, «🏖 Отпуск» или «🏠 Квартира» — и переводите туда деньги с основного.</p>'}
     <div class="actions">
@@ -1302,7 +1316,7 @@ function renderMore(){
   $('shift').onchange = e => { S.settings.shift = e.target.checked; commit(); };
   $('reset').onclick = async () => {
     if (!(await ask(SHARED ? 'Удалить все данные общего календаря у обоих участников? Это нельзя отменить.' : 'Удалить все данные? Это нельзя отменить.'))) return;
-    LOAD_FAILED = false; S = blankState(); if (SHARED) PRIV = { v: 1, ops: [] }; commit(); onboarding();
+    LOAD_FAILED = false; S = blankState(); if (SHARED) PRIV = { v: 1, ops: [], accounts: [] }; commit(); onboarding();
   };
 }
 
@@ -1396,7 +1410,7 @@ function personalSheet(){
   const t = today();
   const items = [
     ...S.ops.filter(op => op.cat === 'move' && (op.from === 'me' || op.to === 'me') && op.by === ME).map(op => ({ op, move: true })),
-    ...PRIV.ops.map(op => ({ op })),
+    ...PRIV.ops.filter(op => op.cat !== 'move' || op.from === 'me' || op.to === 'me').map(op => ({ op, move: op.cat === 'move' })),
   ].sort((x, y) => y.op.date.localeCompare(x.op.date) || (y.op.ts || 0) - (x.op.ts || 0));
   openSheet(`
     <h2>🕶️ Личный счёт</h2>
@@ -1406,7 +1420,7 @@ function personalSheet(){
       const op = it.op;
       if (it.move){
         const inn = op.to === 'me';
-        return `<li class="row" data-h="${i}"><span class="t">${fmtDate(op.date, {day:'numeric', month:'long', year:'numeric'})}${op.date > t ? ' · план' : ''}<small>${inn ? 'с общего счёта' : 'на общий счёт'}${op.note ? ' · ' + esc(op.note) : ''}</small></span><span class="a num ${inn ? 'pos' : 'negc'}">${inn ? '+' : '−'}${fmtMoney(moveBase(op))}</span></li>`;
+        return `<li class="row" data-h="${i}"><span class="t">${fmtDate(op.date, {day:'numeric', month:'long', year:'numeric'})}${op.date > t ? ' · план' : ''}<small>${esc(inn ? 'из: ' + accLabel(op.from, op.by) : 'на: ' + accLabel(op.to, op.by))}${op.note ? ' · ' + esc(op.note) : ''}</small></span><span class="a num ${inn ? 'pos' : 'negc'}">${inn ? '+' : '−'}${fmtMoney(moveBase(op))}</span></li>`;
       }
       const v = toBase(op.amount, op.cur, op.rate), c = v > 0 ? (INCOME_CATS[op.cat] || INCOME_CATS.inc) : catOf(op.cat);
       return `<li class="row" data-h="${i}"><span class="ic">${esc(c.i)}</span><span class="t">${esc(op.note || c.n)}<small>${fmtDate(op.date, {day:'numeric', month:'long', year:'numeric'})}${op.date > t ? ' · план' : ''}</small></span><span class="a num ${v > 0 ? 'pos' : 'negc'}">${fmtSigned(v)}</span></li>`;
@@ -1421,7 +1435,7 @@ function personalSheet(){
 /* Изменение конкретного начисления в календаре */
 /* ================== Формы: счета и переводы ================== */
 function accountSheet(a){
-  const hist = S.ops.filter(op => op.cat === 'move' && (op.from === a.id || op.to === a.id))
+  const hist = [...S.ops, ...PRIV.ops].filter(op => op.cat === 'move' && (op.from === a.id || op.to === a.id))
     .sort((x, y) => y.date.localeCompare(x.date) || (y.ts || 0) - (x.ts || 0));
   const t = today();
   openSheet(`
@@ -1450,6 +1464,8 @@ function editAccount(a){
     <label class="field"><span>Значок — выберите или вставьте любой смайлик</span><input id="f_i" value="${a ? esc(a.icon) : '🐷'}"></label>
     <div class="emojis">${ACC_ICONS.map(i => `<button type="button" data-i="${i}">${i}</button>`).join('')}</div>
     ${a ? '' : amtField('Уже отложено (необязательно, с основного не списывается)', 'f_a', '', BASE)}
+    ${a ? ((PRIV.accounts || []).includes(a) ? '<p class="hint">🕶️ Личная копилка: видна только вам.</p>' : '')
+        : SHARED ? '<label class="switch"><span>🕶️ Личная копилка<br><small class="hint">Название и остаток видите только вы; пополнение с общего счёта видно второму участнику</small></span><input type="checkbox" id="f_priv"></label>' : ''}
     <button class="btn block" id="f_save">${a ? 'Сохранить' : 'Создать счёт'}</button>`,
   b => {
     const inp = b.querySelector('#f_i');
@@ -1464,9 +1480,10 @@ function editAccount(a){
       else {
         const init = num(b.querySelector('#f_a').value), cy = b.querySelector('#f_a_c').value;
         if (init > 0 && !checkCur(cy)) return;
+        const priv = SHARED && !!(b.querySelector('#f_priv') || {}).checked;
         const acc = { id: uid(), name, icon };
-        S.accounts.push(acc);
-        if (init > 0) S.ops.push({ id: uid(), ts: Date.now(), date: today(), cat: 'move', from: 'ext', to: acc.id, amount: init, note: 'Уже было отложено', ...curOpt(cy), ...(cy !== BASE ? { rate: rateOf(cy) } : {}) });
+        (priv ? PRIV : S).accounts.push(acc);
+        if (init > 0) pushMove({ id: uid(), ts: Date.now(), date: today(), cat: 'move', from: 'ext', to: acc.id, amount: init, note: 'Уже было отложено', ...curOpt(cy), ...(cy !== BASE ? { rate: rateOf(cy) } : {}) });
       }
       haptic('success'); closeSheet(); commit();
       toast(a ? 'Сохранено' : 'Счёт создан');
@@ -1480,14 +1497,16 @@ async function deleteAccount(a){
     ? `Удалить «${a.name}»? ${fmtMoney(now)} вернутся на основной счёт, запланированные переводы по нему удалятся.`
     : `Удалить «${a.name}»? Запланированные переводы по нему удалятся.`;
   if (!(await ask(msg))) return;
-  S.ops = S.ops.filter(op => !(op.cat === 'move' && op.date > t && (op.from === a.id || op.to === a.id)));
-  if (Math.abs(now) > 0.005) S.ops.push({ id: uid(), ts: Date.now(), date: t, cat: 'move', from: now > 0 ? a.id : 'main', to: now > 0 ? 'main' : a.id, amount: Math.abs(now), note: 'Закрытие счёта' });
+  const planned = op => !(op.cat === 'move' && op.date > t && (op.from === a.id || op.to === a.id));
+  S.ops = S.ops.filter(planned); PRIV.ops = PRIV.ops.filter(planned);
+  if (Math.abs(now) > 0.005) pushMove({ id: uid(), ts: Date.now(), date: t, cat: 'move', from: now > 0 ? a.id : 'main', to: now > 0 ? 'main' : a.id, amount: Math.abs(now), note: 'Закрытие счёта' });
   a.archived = true;   // история переводов остаётся, счёт просто скрывается
   haptic('success'); closeSheet(); commit(); toast('Счёт удалён');
 }
 
 function editMove(op, preset){
-  if (op && (op.from === 'me' || op.to === 'me') && op.by && op.by !== ME) return toast('Чужой личный перевод менять нельзя');
+  if (op && foreignPriv(op)) return toast('Чужой личный перевод менять нельзя');
+  const wasPriv = !!op && PRIV.ops.includes(op);
   const o = op || { from: 'main', to: (accList()[0] || {}).id || (SHARED ? 'me' : undefined), date: SEL, ...preset };
   const ids = sel => [...new Set(['main', ...(SHARED ? ['me'] : []), ...accList().map(a => a.id), ...(sel ? [sel] : [])])];
   const opts = sel => ids(sel).map(id => `<option value="${id}" ${id === sel ? 'selected' : ''}>${esc(accLabel(id, ME))}</option>`).join('');
@@ -1520,12 +1539,18 @@ function editMove(op, preset){
         if (left < -0.005 && !(await ask(`На счёте ${accLabel(from, ME)} не хватит денег: останется ${fmtMoney(left)}. Всё равно перевести?`))) return;
       }
       const data = { date, cat: 'move', from, to, amount: a, note, cur: cy === BASE ? undefined : cy, rate, rdate };
-      if (op) Object.assign(op, data); else S.ops.push({ id: uid(), ts: Date.now(), ...data });
+      const toPriv = isPrivMove(from, to);
+      if (!op) pushMove({ id: uid(), ts: Date.now(), ...data });
+      else if (toPriv === wasPriv) Object.assign(op, data);
+      else {   // после правки перевод стал личным или общим — переносим
+        (wasPriv ? PRIV : S).ops = (wasPriv ? PRIV : S).ops.filter(x => x !== op);
+        pushMove({ id: op.id, ts: op.ts, ...data });
+      }
       haptic('success'); closeSheet(); commit(); selectDate(date);
       if (data.cur) freezeOps();
     };
     const del = b.querySelector('#f_del');
-    if (del) del.onclick = () => { S.ops = S.ops.filter(x => x !== op); closeSheet(); commit(); };
+    if (del) del.onclick = () => { S.ops = S.ops.filter(x => x !== op); PRIV.ops = PRIV.ops.filter(x => x !== op); closeSheet(); commit(); };
   });
 }
 
