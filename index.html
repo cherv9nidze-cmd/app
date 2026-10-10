@@ -382,7 +382,7 @@ async function writeState(){
   if (SHARED) return writeShared();
   const json = JSON.stringify(S);
   try {
-    if (!useCloud()){ localStorage.setItem('money_state', json); return; }
+    if (!useCloud()){ localStorage.setItem('money_state', json); return true; }
     const slot = activeSlot ? otherSlot(activeSlot) : 'a';
     const parts = [];
     for (let i = 0; i < json.length; i += CHUNK) parts.push(json.slice(i, i + CHUNK));
@@ -397,7 +397,8 @@ async function writeState(){
     slotSize[slot] = parts.length;
     if (legacyN){ for (let i = 0; i < legacyN; i++) stale.push('st_' + i); stale.push('st_n'); legacyN = 0; }
     if (stale.length) await cs('removeItems', stale).catch(console.error);
-  } catch(e){ console.error(e); toast('Не удалось сохранить. Проверьте интернет.'); }
+    return true;
+  } catch(e){ console.error(e); toast('Не удалось сохранить. Проверьте интернет.'); return false; }
 }
 
 async function loadFailed(){
@@ -555,14 +556,15 @@ async function writeShared(){
   try {
     for (let attempt = 0; attempt < 4; attempt++){
       const json = JSON.stringify(S);
-      if (json === SYNCED) return;
+      if (json === SYNCED) return true;
       const r = await api('save', { rev: REV, state: S });
-      if (r.status === 200){ REV = r.data.rev; SYNCED = json; return; }
+      if (r.status === 200){ REV = r.data.rev; SYNCED = json; return true; }
       if (r.status === 409 && r.data.error === 'conflict'){ adoptRemote(r.data); continue; }
       throw new Error('save ' + r.status);
     }
   } catch(e){ console.error(e); toast('Не удалось сохранить. Проверьте интернет.'); }
   finally { writing = false; }
+  return false;
 }
 
 // Раз в 15 секунд (и при возвращении в приложение) подтягиваем правки второго участника
@@ -1748,6 +1750,65 @@ function switchTab(name){
 }
 $('tabs').onclick = e => { const b = e.target.closest('[data-tab]'); if (b){ haptic(); switchTab(b.dataset.tab); } };
 
+/* ================== Быстрый ввод через бота ================== */
+// Бот кладёт расходы на сервер (/api/inbox); при открытии и возвращении в приложение они забираются в S.ops,
+// сохраняются, и только после успешной записи сервер получает подтверждение (/api/inbox_ack).
+// Операции идемпотентны: повторно присланная (по id) не дублируется.
+let QUICK = !!(API && inTg);
+const normNote = t => String(t || '').toLowerCase().replace(/ё/g, 'е').replace(/\s+/g, ' ').trim();
+async function flushSave(){
+  clearTimeout(saveTimer);
+  saveChain = saveChain.then(writeState);
+  return saveChain;
+}
+let inboxBusy = false;
+async function pullInbox(){
+  if (!QUICK || LOAD_FAILED || LOCKED || inboxBusy || !$('sheet').hidden) return;
+  inboxBusy = true;
+  try {
+    const r = await api('inbox', {});
+    if (r.status !== 200 || !(r.data.items || []).length) return;
+    let changed = false;
+    for (const it of r.data.items){
+      if (it.type === 'add' && it.op && !S.ops.some(o => o.id === it.op.id)){ S.ops.push(it.op); changed = true; }
+      else if (it.type === 'update'){
+        const o = S.ops.find(x => x.id === it.id);
+        if (o){
+          for (const k of ['amount', 'cat', 'date', 'note', 'cur']) if (k in (it.patch || {})){ if (it.patch[k] === null) delete o[k]; else o[k] = it.patch[k]; }
+          if ('cur' in it.patch || 'date' in it.patch){ delete o.rate; delete o.rdate; }
+          changed = true;
+        }
+      }
+      else if (it.type === 'delete'){ const n = S.ops.length; S.ops = S.ops.filter(o => o.id !== it.id); changed = changed || S.ops.length !== n; }
+    }
+    if (changed){ saveState(); renderAll(); }
+    if (await flushSave() !== false || !changed) await api('inbox_ack', { ids: r.data.items.map(i => i.rid) });
+    if (changed) freezeOps();
+  } catch(e){ console.error(e); }
+  finally { inboxBusy = false; }
+}
+// Знания для бота: категории, самые частые из них и словарь «заметка → категория» из истории. Личные (инкогнито) записи сюда не попадают.
+function buildProfile(){
+  const cats = {}, since = addDays(today(), -90), used = {}, byNote = {};
+  for (const [k, c] of Object.entries(allCats())) cats[k] = { n: c.n, i: c.i, ...(isHiddenCat(k) ? { hidden: true } : {}) };
+  for (const o of S.ops){
+    if (!(o.amount < 0) || o.cat === 'move' || !cats[o.cat]) continue;
+    if (o.date >= since) used[o.cat] = (used[o.cat] || 0) + 1;
+    const n = normNote(o.note).slice(0, 60);
+    if (n){ const m = byNote[n] = byNote[n] || {}; m[o.cat] = (m[o.cat] || 0) + 1; }
+  }
+  const dict = {};
+  Object.entries(byNote).map(([n, m]) => { const [cat, c] = Object.entries(m).sort((a, b) => b[1] - a[1])[0]; return [n, cat, c]; })
+    .sort((a, b) => b[2] - a[2]).slice(0, 400).forEach(([n, cat]) => { dict[n] = cat; });
+  const top = Object.keys(cats).filter(k => !cats[k].hidden && k !== 'plan').sort((a, b) => (used[b] || 0) - (used[a] || 0));
+  return { base: BASE, cats, top, dict };
+}
+async function sendProfile(){
+  if (!QUICK || LOAD_FAILED || LOCKED) return;
+  try { await api('profile', { profile: buildProfile() }); } catch(e){ console.error(e); }
+}
+document.addEventListener('visibilitychange', () => { if (!document.hidden){ pullInbox(); } });
+
 /* ================== Старт ================== */
 (async () => {
   const loaded = await loadState();
@@ -1758,6 +1819,8 @@ $('tabs').onclick = e => { const b = e.target.closest('[data-tab]'); if (b){ hap
   renderAll(); selectDate(today());
   if (LOAD_FAILED) loadFailed();
   else if (!loaded) onboarding();
+  await pullInbox();
+  sendProfile();
   await refreshRates();
   freezeOps();
 })();
