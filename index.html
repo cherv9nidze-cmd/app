@@ -533,6 +533,13 @@ function merge3(base, mine, theirs){
     if (m === undefined) delete ov[key]; else ov[key] = m;
   }
   out.ov = ov;
+  const ca = { ...(theirs.catAcc || {}) };   // привязка категорий к счетам
+  for (const key of new Set([...Object.keys(base.catAcc || {}), ...Object.keys(mine.catAcc || {})])){
+    const b = (base.catAcc || {})[key], m = (mine.catAcc || {})[key];
+    if (same(b, m)) continue;
+    if (m === undefined) delete ca[key]; else ca[key] = m;
+  }
+  out.catAcc = ca;
   const bh = base.hiddenCats || [], mh = mine.hiddenCats || [];
   out.hiddenCats = [...new Set([...(theirs.hiddenCats || []), ...mh.filter(x => !bh.includes(x))])]
     .filter(x => !(bh.includes(x) && !mh.includes(x)));
@@ -627,17 +634,18 @@ async function leaveShared(){
 let S = null;          // данные пользователя
 let EV = new Map();    // дата -> события
 let BAL = new Map();   // дата -> остаток на конец дня
+let ACCEV = new Map(); // id счёта -> [{date, amount}]: расходы и доходы, проведённые через этот счёт, а не через основной
 let SEL = today();     // выбранный день
 let VIEW = {y: new Date().getFullYear(), m: new Date().getMonth()}; // открытый месяц
 let SM = {y: new Date().getFullYear(), m: new Date().getMonth()};   // месяц на вкладке «Расходы»
 
 // загруженный курс переносится в новое состояние (онбординг, сброс), чтобы не качать его заново
-const blankState = () => ({ v:1, start:{date:today(), balance:0, ts:Date.now()}, rules:[], ov:{}, ops:[], accounts:[], cats:[], hiddenCats:[], settings:{shift:false, base: S && S.settings && S.settings.base || 'BYN', horizon: S && S.settings && S.settings.horizon || 24}, fx: S && S.fx || undefined });
+const blankState = () => ({ v:1, start:{date:today(), balance:0, ts:Date.now()}, rules:[], ov:{}, ops:[], accounts:[], cats:[], hiddenCats:[], catAcc:{}, settings:{shift:false, base: S && S.settings && S.settings.base || 'BYN', horizon: S && S.settings && S.settings.horizon || 24}, fx: S && S.fx || undefined });
 
 // Недостающие поля старых версий данных
 function normalizeState(s){
   s.settings = s.settings || { shift: false }; s.settings.base = s.settings.base || 'BYN';
-  s.ov = s.ov || {}; s.ops = s.ops || []; s.rules = s.rules || []; s.accounts = s.accounts || []; s.cats = s.cats || []; s.hiddenCats = s.hiddenCats || [];
+  s.ov = s.ov || {}; s.ops = s.ops || []; s.rules = s.rules || []; s.accounts = s.accounts || []; s.cats = s.cats || []; s.hiddenCats = s.hiddenCats || []; s.catAcc = s.catAcc || {};
   return s;
 }
 
@@ -790,6 +798,16 @@ const meLabel = by => '🕶️ Личный' + (by && by !== ME ? ' (' + ((MEMBE
 const accLabel = (id, by) => id === 'main' ? '💳 Основной' : id === 'ext' ? '➕ Извне' : id === 'me' ? meLabel(by) : (a => a ? a.icon + ' ' + a.name : by && by !== ME ? meLabel(by) : '❔ Удалённый счёт')(accById(id));
 const isMove = e => e.op && e.op.cat === 'move';
 const moveBase = op => toBase(op.amount, op.cur, op.rate);
+// Через какой счёт проходит расход/доход: 'main' или id общего счёта. Закрытый счёт после дня закрытия отдаёт платежи основному.
+const payAccs = () => (S.accounts || []).filter(a => !a.archived);
+function evAcc(acc, date){
+  if (!acc || acc === 'main') return 'main';
+  const a = (S.accounts || []).find(x => x.id === acc);
+  return !a || (a.archived && date > (a.archivedOn || '')) ? 'main' : acc;
+}
+// Явный счёт операции, иначе счёт, привязанный к категории расхода, иначе основной
+const opAcc = op => op.cat === 'move' ? 'main' : evAcc(op.acc !== undefined ? op.acc : op.amount < 0 ? (S.catAcc || {})[op.cat] : undefined, op.date);
+const accNote = e => e.acc && e.acc !== 'main' ? (e.amount < 0 ? 'со счёта ' : 'на счёт ') + accLabel(e.acc) : '';
 // Остаток счёта на конец дня d (skip — операцию не учитывать, нужно при её правке)
 function accBal(id, d, skip){
   let b = 0;
@@ -799,6 +817,7 @@ function accBal(id, d, skip){
     add(op);
     if (id === 'me' && op.cat !== 'move' && op !== skip && op.date <= d) b += toBase(op.amount, op.cur, op.rate);
   }
+  for (const x of ACCEV.get(id) || []) if (x.date <= d) b += x.amount;
   return b;
 }
 const firstGrapheme = s => {
@@ -835,7 +854,8 @@ function occurrence(rule, y, m){
     if (wd === 0) d.setDate(d.getDate() - 2);
   }
   const ub = sign * toBase(util, ucur);
-  return { date: iso(d), amount: sign * toBase(amount, cur) + ub, util: ub, orig: { amount, cur, util, ucur }, rule, ym, day, changed: !!o };
+  const acc = o && o.amount != null ? o.acc : v.acc;
+  return { date: iso(d), amount: sign * toBase(amount, cur) + ub, util: ub, acc, orig: { amount, cur, util, ucur }, rule, ym, day, changed: !!o };
 }
 function counts(e){
   const sd = S.start.date;
@@ -847,11 +867,16 @@ function counts(e){
 function rebuild(){
   BASE = S.settings.base || 'BYN';
   applyHorizon();
-  EV = new Map(); BAL = new Map(); FX_MISSING = false;
+  EV = new Map(); BAL = new Map(); ACCEV = new Map(); FX_MISSING = false;
   const t = today();
   const from = [S.start.date, addDays(t, -400)].sort()[0];
   const to = addDays(t, RANGE);
-  const push = e => { if (!EV.has(e.date)) EV.set(e.date, []); EV.get(e.date).push(e); };
+  const push = e => {
+    if (!EV.has(e.date)) EV.set(e.date, []);
+    EV.get(e.date).push(e);
+    e.acc = e.priv || e.move != null ? 'main' : evAcc(e.acc, e.date);
+    if (e.acc !== 'main'){ if (!ACCEV.has(e.acc)) ACCEV.set(e.acc, []); ACCEV.get(e.acc).push({ date: e.date, amount: e.amount }); }
+  };
   let d = parse(from); d.setDate(1); d.setMonth(d.getMonth() - 1);
   const end = parse(to); end.setMonth(end.getMonth() + 1);
   while (d <= end){
@@ -863,7 +888,7 @@ function rebuild(){
       // на основном счёте перевод виден только если он в нём участвует
       const v = moveBase(op);
       push({ date: op.date, amount: (op.to === 'main' ? v : 0) - (op.from === 'main' ? v : 0), move: v, op });
-    } else push({ date: op.date, amount: toBase(op.amount, op.cur, op.rate), op });
+    } else push({ date: op.date, amount: toBase(op.amount, op.cur, op.rate), op, acc: opAcc(op) });
   }
   // Личные записи только показываются в календаре (priv) и не влияют на общий остаток
   if (SHARED) for (const op of PRIV.ops){
@@ -872,7 +897,7 @@ function rebuild(){
   }
   let b = S.start.balance, cur = S.start.date;
   while (cur <= to){
-    for (const e of EV.get(cur) || []) if (!e.priv && counts(e)) b += e.amount;
+    for (const e of EV.get(cur) || []) if (!e.priv && e.acc === 'main' && counts(e)) b += e.amount;
     BAL.set(cur, b);
     cur = addDays(cur, 1);
   }
@@ -883,7 +908,7 @@ const balOn = d => BAL.has(d) ? BAL.get(d) : null;
 function nextIncome(after){
   for (let i = 1; i <= 62; i++){
     const d = addDays(after, i);
-    const ev = (EV.get(d) || []).filter(e => e.rule && e.amount > 0);
+    const ev = (EV.get(d) || []).filter(e => e.rule && e.amount > 0 && e.acc === 'main');
     if (ev.length) return { date: d, days: i, amount: ev.reduce((s, e) => s + e.amount, 0), name: ev.map(e => e.rule.name).join(' + ') };
   }
   return null;
@@ -975,12 +1000,12 @@ function eventRow(e, i){
   if (e.rule){
     const k = KINDS[e.rule.kind];
     return `<li class="row" data-ev="${i}"><span class="ic">${k.icon}</span>
-      <span class="t">${esc(e.rule.name)}${who(e.rule)}<small>${e.changed ? 'изменено только в этом месяце' : 'каждый месяц, ' + (e.day >= 29 ? e.day + '-го или последний день' : e.day + '-го')}${e.orig.util ? ` · аренда ${fmtCur(e.orig.amount, e.orig.cur)} + коммуналка ≈ ${fmtCur(e.orig.util, e.orig.ucur)}` : e.orig.cur !== BASE ? ' · ' + fmtCur(e.orig.amount, e.orig.cur) : ''}</small></span>
+      <span class="t">${esc(e.rule.name)}${who(e.rule)}<small>${e.changed ? 'изменено только в этом месяце' : 'каждый месяц, ' + (e.day >= 29 ? e.day + '-го или последний день' : e.day + '-го')}${e.orig.util ? ` · аренда ${fmtCur(e.orig.amount, e.orig.cur)} + коммуналка ≈ ${fmtCur(e.orig.util, e.orig.ucur)}` : e.orig.cur !== BASE ? ' · ' + fmtCur(e.orig.amount, e.orig.cur) : ''}${accNote(e) ? ' · ' + esc(accNote(e)) : ''}</small></span>
       <span class="a num ${e.amount > 0 ? 'pos' : 'negc'}">${fmtSigned(e.amount)}</span></li>`;
   }
   const c = e.amount > 0 ? (INCOME_CATS[e.op.cat] || INCOME_CATS.inc) : catOf(e.op.cat);
   const isPlan = e.op.cat === 'plan';
-  const sub = [e.op.note ? c.n : '', e.op.cur && e.op.cur !== BASE ? fmtCur(Math.abs(e.op.amount), e.op.cur) + (e.op.rdate ? ' по курсу НБРБ ' + fmtNum(e.op.rate, 4) : ' по текущему курсу') : ''].filter(Boolean).join(' · ');
+  const sub = [e.op.note ? c.n : '', e.op.cur && e.op.cur !== BASE ? fmtCur(Math.abs(e.op.amount), e.op.cur) + (e.op.rdate ? ' по курсу НБРБ ' + fmtNum(e.op.rate, 4) : ' по текущему курсу') : '', esc(accNote(e))].filter(Boolean).join(' · ');
   return `<li class="row" data-ev="${i}"><span class="ic">${c.i}</span>
     <span class="t">${esc(e.op.note || c.n)}${e.priv ? '<span class="by">🕶️ инкогнито</span>' : who(e.op)}${sub ? `<small>${sub}</small>` : ''}</span>
     <span class="a num ${isPlan ? 'planc' : e.amount > 0 ? 'pos' : 'negc'}">${fmtSigned(e.amount)}</span></li>`;
@@ -1059,7 +1084,7 @@ function renderRules(){
     for (const r of rules){
       let v = versionFor(r, ym);
       if (!v){ v = r.v.slice().sort((a,b) => a.from < b.from ? -1 : 1)[0]; }
-      const desc = !v || v.stop ? 'остановлено' : `${fmtCur(v.amount, v.cur)}${v.util ? ' + коммуналка ≈ ' + fmtCur(v.util, v.ucur) : ''}${(v.cur && v.cur !== BASE) || (v.util && v.ucur && v.ucur !== BASE) ? ' = ' + fmtMoney(toBase(v.amount, v.cur) + toBase(v.util || 0, v.ucur)) : ''} · ${v.day >= 29 ? v.day + '-го (или последний день)' : v.day + '-го'}${v.from > ym ? ' · с ' + fmtDate(v.from + '-01', {month:'long', year:'numeric'}) : ''}`;
+      const desc = !v || v.stop ? 'остановлено' : `${fmtCur(v.amount, v.cur)}${v.util ? ' + коммуналка ≈ ' + fmtCur(v.util, v.ucur) : ''}${(v.cur && v.cur !== BASE) || (v.util && v.ucur && v.ucur !== BASE) ? ' = ' + fmtMoney(toBase(v.amount, v.cur) + toBase(v.util || 0, v.ucur)) : ''} · ${v.day >= 29 ? v.day + '-го (или последний день)' : v.day + '-го'}${v.from > ym ? ' · с ' + fmtDate(v.from + '-01', {month:'long', year:'numeric'}) : ''}${!v.stop && evAcc(v.acc, t) !== 'main' ? ' · ' + (KINDS[r.kind].sign < 0 ? 'со счёта ' : 'на счёт ') + esc(accLabel(v.acc)) : ''}`;
       html += `<div class="row" data-rule="${r.id}"><span class="ic">${KINDS[r.kind].icon}</span><span class="t">${esc(r.name)}<small>${desc}</small></span><span class="a">›</span></div>`;
     }
     html += '</div>';
@@ -1363,6 +1388,15 @@ function toast(msg){ const t = document.createElement('div'); t.className = 'toa
 function ask(msg){ return new Promise(res => inTg && tg.showConfirm ? tg.showConfirm(msg, ok => res(ok)) : res(confirm(msg))); }
 function commit(){ saveState(); renderAll(); }
 
+/* Выбор счёта для расхода, дохода или регулярного платежа; без созданных счетов поле не показывается */
+function accSelect(id, sel, label){
+  const list = payAccs();
+  if (!list.length) return '';
+  return `<label class="field"><span>${label}</span><select id="${id}">
+    <option value="main">💳 Основной</option>${list.map(a => `<option value="${a.id}" ${a.id === sel ? 'selected' : ''}>${esc(a.icon)} ${esc(a.name)}</option>`).join('')}</select></label>`;
+}
+const accOpt = acc => acc && acc !== 'main' ? { acc } : {};
+
 /* Расход / доход за день */
 /* Категории расходов в порядке «популярности»: сначала самые частые за последние 90 дней, затем остальные */
 function sortedExpenseCats(keep){
@@ -1377,13 +1411,15 @@ function sortedExpenseCats(keep){
 function editOp(op, sign, draft){
   const isNew = !op; sign = op ? Math.sign(op.amount) : sign;
   const wasPriv = !!op && PRIV.ops.includes(op);
-  const d = draft || (op ? { amount: Math.abs(op.amount), cur: op.cur, cat: op.cat, date: op.date, note: op.note, inc: wasPriv } : {});
+  const d = draft || (op ? { amount: Math.abs(op.amount), cur: op.cur, cat: op.cat, date: op.date, note: op.note, inc: wasPriv, acc: opAcc(op) } : {});
   const cats = sign < 0 ? sortedExpenseCats(d.cat) : Object.entries(INCOME_CATS);
   const cur = d.cat || cats[0][0];
+  const accSel = d.acc !== undefined ? d.acc : sign < 0 ? evAcc((S.catAcc || {})[cur], today()) : 'main';
   openSheet(`
     <h2>${isNew ? (sign < 0 ? 'Новый расход' : 'Новый доход') : 'Изменить запись'}</h2>
     ${amtField('Сумма', 'f_a', d.amount || '', d.cur || BASE)}
     <div class="chips">${cats.map(([k, c]) => `<label><input type="radio" name="cat" value="${k}" ${k === cur ? 'checked' : ''}>${esc(c.i)} ${esc(c.n)}</label>`).join('')}${sign < 0 ? '<label id="f_newcat" style="color:var(--accent)">＋ Своя</label>' : ''}</div>
+    ${accSelect('f_acc', accSel, sign < 0 ? 'Списать со счёта' : 'Зачислить на счёт')}
     <label class="field"><span>Дата</span><input id="f_d" type="date" value="${d.date || SEL}"></label>
     <label class="field"><span>Комментарий</span><input id="f_n" value="${esc(d.note || '')}" placeholder="необязательно"></label>
     ${SHARED ? `<label class="switch"><span>🕶️ Инкогнито<br><small class="hint">Видно только вам, считается с личного счёта, общий остаток не меняется</small></span><input type="checkbox" id="f_inc" ${d.inc ? 'checked' : ''}></label>` : ''}
@@ -1393,9 +1429,21 @@ function editOp(op, sign, draft){
     // «＋ Своя»: создаём категорию и возвращаемся в эту же форму с уже введёнными данными
     const nc = b.querySelector('#f_newcat');
     if (nc) nc.onclick = () => {
-      const keep = { amount: b.querySelector('#f_a').value, cur: b.querySelector('#f_a_c').value, date: b.querySelector('#f_d').value, note: b.querySelector('#f_n').value, inc: !!(b.querySelector('#f_inc') || {}).checked };
+      const keep = { amount: b.querySelector('#f_a').value, cur: b.querySelector('#f_a_c').value, date: b.querySelector('#f_d').value, note: b.querySelector('#f_n').value, inc: !!(b.querySelector('#f_inc') || {}).checked, acc: (b.querySelector('#f_acc') || {}).value };
       editCat(null, id => editOp(op, sign, { ...keep, cat: id }));
     };
+    // выбор категории подставляет счёт, привязанный к ней, пока счёт не выбран вручную
+    const accEl = b.querySelector('#f_acc');
+    if (accEl){
+      let touched = !isNew || !!draft;
+      accEl.onchange = () => { touched = true; };
+      if (sign < 0) b.querySelectorAll('input[name=cat]').forEach(r => r.onchange = () => {
+        if (!touched) accEl.value = evAcc((S.catAcc || {})[r.value], today());
+      });
+      const inc = b.querySelector('#f_inc');
+      if (inc) inc.onchange = () => { accEl.closest('label').hidden = inc.checked; };
+      if (inc && inc.checked) accEl.closest('label').hidden = true;
+    }
     b.querySelector('#f_save').onclick = () => {
       const a = num(b.querySelector('#f_a').value);
       if (!(a > 0)) return toast('Введите сумму больше нуля');
@@ -1409,6 +1457,7 @@ function editOp(op, sign, draft){
       const rdate = same ? op.rdate : undefined;
       const data = { date, amount: sign * a, cat: b.querySelector('input[name=cat]:checked').value, note: b.querySelector('#f_n').value.trim(), cur: cy === BASE ? undefined : cy, rate, rdate };
       const inc = SHARED && !!(b.querySelector('#f_inc') || {}).checked;
+      if (accEl && !inc) data.acc = accEl.value; else data.acc = undefined;
       if (isNew) (inc ? PRIV : S).ops.push({ id: uid(), ts: Date.now(), ...data });
       else if (inc === wasPriv) Object.assign(op, data);
       else {   // запись перенесли между общими и личными
@@ -1453,14 +1502,21 @@ function personalSheet(){
 /* Изменение конкретного начисления в календаре */
 /* ================== Формы: счета и переводы ================== */
 function accountSheet(a){
-  const hist = [...S.ops, ...PRIV.ops].filter(op => op.cat === 'move' && (op.from === a.id || op.to === a.id))
+  const isMine = op => op.from === a.id || op.to === a.id;
+  const hist = [...S.ops.filter(op => op.cat === 'move' ? isMine(op) : opAcc(op) === a.id), ...PRIV.ops.filter(op => op.cat === 'move' && isMine(op))]
     .sort((x, y) => y.date.localeCompare(x.date) || (y.ts || 0) - (x.ts || 0));
   const t = today();
   openSheet(`
     <h2>${esc(a.icon)} ${esc(a.name)}</h2>
     <p class="hint" style="margin:-6px 0 12px">${SEL === t ? 'Сейчас' : 'На ' + fmtDate(SEL, {day:'numeric', month:'long', year:'numeric'})}: <b class="num">${fmtMoney(accBal(a.id, SEL))}</b></p>
     <div class="actions" style="margin:0 0 4px"><button class="btn" id="a_in">＋ Пополнить</button><button class="btn soft" id="a_out">Снять</button></div>
+    ${(S.accounts || []).includes(a) ? `<button class="btn soft block" id="a_cats" style="margin-top:12px">🏷️ Категории расходов${linkedCats(a.id).length ? ' (' + linkedCats(a.id).length + ')' : ''}</button>
+    <p class="hint" style="margin:6px 0 0">Расходы привязанных категорий и регулярные платежи со счёта списываются отсюда, а не с основного.</p>` : ''}
     ${hist.length ? `<ul class="list">${hist.slice(0, 40).map((op, i) => {
+      if (op.cat !== 'move'){
+        const v = toBase(op.amount, op.cur, op.rate), c = v > 0 ? (INCOME_CATS[op.cat] || INCOME_CATS.inc) : catOf(op.cat);
+        return `<li class="row" data-h="${i}"><span class="ic">${esc(c.i)}</span><span class="t">${esc(op.note || c.n)}<small>${fmtDate(op.date, {day:'numeric', month:'long', year:'numeric'})}${op.date > t ? ' · план' : ''}</small></span><span class="a num ${v > 0 ? 'pos' : 'negc'}">${fmtSigned(v)}</span></li>`;
+      }
       const inn = op.to === a.id;
       return `<li class="row" data-h="${i}"><span class="t">${fmtDate(op.date, {day:'numeric', month:'long', year:'numeric'})}${op.date > t ? ' · план' : ''}<small>${esc(inn ? 'из: ' + accLabel(op.from) : 'на: ' + accLabel(op.to))}${op.note ? ' · ' + esc(op.note) : ''}</small></span><span class="a num ${inn ? 'pos' : 'negc'}">${inn ? '+' : '−'}${fmtMoney(moveBase(op))}</span></li>`;
     }).join('')}</ul>` : '<p class="empty-note">Переводов пока нет</p>'}
@@ -1469,9 +1525,41 @@ function accountSheet(a){
   b => {
     b.querySelector('#a_in').onclick = () => editMove(null, { from: 'main', to: a.id });
     b.querySelector('#a_out').onclick = () => editMove(null, { from: a.id, to: 'main' });
-    b.querySelectorAll('[data-h]').forEach(el => el.onclick = () => editMove(hist[+el.dataset.h]));
+    b.querySelectorAll('[data-h]').forEach(el => el.onclick = () => { const op = hist[+el.dataset.h]; op.cat === 'move' ? editMove(op) : editOp(op); });
+    if (b.querySelector('#a_cats')) b.querySelector('#a_cats').onclick = () => linkCatsSheet(a);
     b.querySelector('#a_edit').onclick = () => editAccount(a);
     b.querySelector('#a_del').onclick = () => deleteAccount(a);
+  });
+}
+
+const linkedCats = accId => Object.keys(S.catAcc || {}).filter(k => S.catAcc[k] === accId);
+/* Привязать категорию расходов к счёту (accId = null — отвязать). Прошлые записи без явного счёта сначала
+   закрепляются за тем счётом, с которого они списывались, чтобы смена привязки не меняла историю. */
+function setCatLink(cat, accId){
+  const t = today();
+  for (const op of S.ops) if (op.cat === cat && op.amount < 0 && op.acc === undefined && op.date <= t) op.acc = opAcc(op);
+  S.catAcc = S.catAcc || {};
+  if (accId) S.catAcc[cat] = accId; else delete S.catAcc[cat];
+}
+function linkCatsSheet(a){
+  const cats = sortedExpenseCats().filter(([k]) => k !== 'plan');
+  const other = k => { const id = (S.catAcc || {})[k]; return id && id !== a.id ? accById(id) : null; };
+  openSheet(`
+    <h2>${esc(a.icon)} ${esc(a.name)}: категории</h2>
+    <p class="hint" style="margin:-6px 0 12px">Новые расходы выбранных категорий будут списываться с этого счёта. Уже внесённые записи остаются на своих местах. Во время ввода счёт можно сменить вручную.</p>
+    <div class="chips">${cats.map(([k, c]) => `<label data-k="${esc(k)}"><input type="checkbox" value="${esc(k)}" ${S.catAcc[k] === a.id ? 'checked' : ''}>${esc(c.i)} ${esc(c.n)}${other(k) ? ` <small class="hint">· ${esc(other(k).name)}</small>` : ''}</label>`).join('')}</div>
+    <button class="btn block" id="f_save">Сохранить</button>`,
+  b => {
+    const mark = () => b.querySelectorAll('.chips label').forEach(l => l.classList.toggle('on', l.querySelector('input').checked));
+    mark(); b.querySelector('.chips').addEventListener('change', mark);
+    b.querySelector('#f_save').onclick = () => {
+      b.querySelectorAll('.chips input').forEach(i => {
+        const was = S.catAcc[i.value] === a.id;
+        if (i.checked && !was) setCatLink(i.value, a.id);
+        else if (!i.checked && was) setCatLink(i.value, null);
+      });
+      haptic('success'); closeSheet(); commit(); toast('Сохранено');
+    };
   });
 }
 
@@ -1518,7 +1606,8 @@ async function deleteAccount(a){
   const planned = op => !(op.cat === 'move' && op.date > t && (op.from === a.id || op.to === a.id));
   S.ops = S.ops.filter(planned); PRIV.ops = PRIV.ops.filter(planned);
   if (Math.abs(now) > 0.005) pushMove({ id: uid(), ts: Date.now(), date: t, cat: 'move', from: now > 0 ? a.id : 'main', to: now > 0 ? 'main' : a.id, amount: Math.abs(now), note: 'Закрытие счёта' });
-  a.archived = true;   // история переводов остаётся, счёт просто скрывается
+  for (const k of linkedCats(a.id)) setCatLink(k, null);   // прошлые траты остаются на этом счёте
+  a.archived = true; a.archivedOn = t;   // история переводов остаётся, счёт просто скрывается; платежи после этого дня идут с основного
   haptic('success'); closeSheet(); commit(); toast('Счёт удалён');
 }
 
@@ -1582,6 +1671,7 @@ function editOccurrence(e){
       <label class="field"><span>Число месяца</span><input id="f_d" inputmode="numeric" value="${e.day}"></label>
     </div>
     ${utilField(e.orig.util, e.orig.ucur, !KINDS[r.kind].util)}
+    ${accSelect('f_acc', e.acc, KINDS[r.kind].sign < 0 ? 'Списывать со счёта' : 'Зачислять на счёт')}
     <p class="hint" style="margin:-4px 0 12px">Если указать 31, а в месяце меньше дней, будет последний день месяца.</p>
     <button class="btn block" id="f_one">Сохранить только в ${inMonth}</button>
     <button class="btn soft block" id="f_fwd">Сохранить с ${fromMonth} и дальше</button>
@@ -1596,8 +1686,9 @@ function editOccurrence(e){
       if (!checkCur(cy)) return;
       const util = KINDS[r.kind].util ? readUtil(b.querySelector('#f_u')) : 0, ucy = b.querySelector('#f_u_c').value;
       if (util && !checkCur(ucy)) return;
-      if (scope === 'one') S.ov[r.id + '|' + ym] = { amount, day, ...curOpt(cy), ...utilOpt(util, ucy) };
-      else setFrom(r, ym, { amount, day, ...curOpt(cy), ...utilOpt(util, ucy) });
+      const ac = accOpt((b.querySelector('#f_acc') || {}).value);
+      if (scope === 'one') S.ov[r.id + '|' + ym] = { amount, day, ...curOpt(cy), ...utilOpt(util, ucy), ...ac };
+      else setFrom(r, ym, { amount, day, ...curOpt(cy), ...utilOpt(util, ucy), ...ac });
       haptic('success'); closeSheet(); commit();
       toast(scope === 'one' ? `Изменено только в ${inMonth}` : `Изменено с ${fromMonth} и дальше`);
     };
@@ -1632,6 +1723,7 @@ function editRule(rule){
       <label class="field"><span>Число месяца</span><input id="f_d" inputmode="numeric" value="${v && !v.stop ? v.day : ''}" placeholder="1–31"></label>
     </div>
     ${utilField(v && !v.stop ? v.util : '', v && v.ucur, !KINDS[kind].util)}
+    ${accSelect('f_acc', v && !v.stop ? evAcc(v.acc, today()) : 'main', 'Счёт: откуда списывать или куда зачислять')}
     <label class="field"><span>${rule ? 'Новые значения действуют с месяца' : 'Начиная с месяца'}</span><input id="f_m" type="month" value="${curYm}"></label>
     ${rule ? '<p class="hint" style="margin:-4px 0 12px">Меняет сумму с выбранного месяца и <b>все следующие</b>. Чтобы изменить только один месяц, нажмите на начисление в календаре.</p>' : ''}
     <button class="btn block" id="f_save">Сохранить</button>
@@ -1648,8 +1740,9 @@ function editRule(rule){
       const day = clampDay(dv), from = b.querySelector('#f_m').value || curYm;
       const util = KINDS[rule ? rule.kind : k.value].util ? readUtil(b.querySelector('#f_u')) : 0, ucy = b.querySelector('#f_u_c').value;
       if (util && !checkCur(ucy)) return;
-      if (rule){ rule.name = n.value.trim() || rule.name; setFrom(rule, from, { amount, day, ...curOpt(cy), ...utilOpt(util, ucy) }); }
-      else S.rules.push({ id: uid(), kind: k.value, name: n.value.trim() || KINDS[k.value].name, v: [{ from, amount, day, ...curOpt(cy), ...utilOpt(util, ucy) }] });
+      const ac = accOpt((b.querySelector('#f_acc') || {}).value);
+      if (rule){ rule.name = n.value.trim() || rule.name; setFrom(rule, from, { amount, day, ...curOpt(cy), ...utilOpt(util, ucy), ...ac }); }
+      else S.rules.push({ id: uid(), kind: k.value, name: n.value.trim() || KINDS[k.value].name, v: [{ from, amount, day, ...curOpt(cy), ...utilOpt(util, ucy), ...ac }] });
       haptic('success'); closeSheet(); commit();
     };
     const del = b.querySelector('#f_del');
