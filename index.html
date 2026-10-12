@@ -45,6 +45,8 @@ button,input,select{font:inherit;color:inherit}
 .hero-sub{font-size:14px;color:var(--hint);min-height:20px}
 .hero-sub b{color:var(--text);font-weight:600}
 .hero-warn{color:var(--red);font-size:14px;margin-top:4px}
+.hero-warn.act{cursor:pointer;text-decoration:underline dotted}
+.cmp{width:100%;border-collapse:collapse;margin:8px 0 12px;font-size:14px}.cmp th{font-weight:500;color:var(--hint);text-align:right}.cmp th:first-child,.cmp td:first-child{text-align:left}.cmp td{padding:6px 0;border-top:1px solid var(--bg2)}.cmp td.num{text-align:right}
 
 /* slider */
 .slider-wrap{margin:16px 0 4px}
@@ -416,6 +418,7 @@ const URLQ = new URLSearchParams(location.search);
 const API = (URLQ.get('api') || '').replace(/\/+$/, '');
 const JOIN = URLQ.get('join');
 let LOCKED = false;   // сервер ответил 403: этого пользователя нет в списке допущенных
+let AIOK = false;   // сервер разрешил этому пользователю вызовы ИИ (AI_ALLOWED_IDS)
 let SHARED = false, REV = 0, SYNCED = '', MEMBERS = [], ME = 0, writing = false;
 const flag = {   // «этот пользователь в общем календаре» — чтобы при недоступном сервере не открыть личный
   get(){ try { return localStorage.getItem('money_shared') === '1'; } catch(e){ return false; } },
@@ -433,6 +436,7 @@ function enterShared(d){ SHARED = true; ME = d.me; REV = d.rev; MEMBERS = d.memb
 async function loadShared(){
   try {
     let r = await api('me', {});
+    AIOK = r.status === 200 && !!r.data.ai;
     if (r.status === 200 && JOIN){
       if (r.data.member) toast('Вы уже состоите в общем календаре');
       else if (await ask('Присоединиться к общему календарю? Ваши личные данные в Telegram останутся нетронутыми, но вместо них будет открываться общий календарь.')){
@@ -581,7 +585,7 @@ async function pollShared(){
   try {
     const r = await api('me', { since: REV });
     if (r.status !== 200 || !r.data.member) return;
-    MEMBERS = r.data.members;
+    MEMBERS = r.data.members; AIOK = !!r.data.ai;
     if (r.data.state && r.data.rev > REV && !writing && JSON.stringify(S) === SYNCED) adoptRemote(r.data);
   } catch(e){ console.error(e); }
 }
@@ -956,7 +960,8 @@ function renderHero(){
   $('heroSub').innerHTML = sub;
   const neg = firstNegative();
   $('heroWarn').textContent = FX_MISSING ? '⚠️ Курс валют не загружен — суммы в валюте не учтены'
-    : neg ? `⚠️ Уход в минус ${fmtDate(neg, {day:'numeric', month:'long', year:'numeric'})}` : '';
+    : neg ? `⚠️ Уход в минус ${fmtDate(neg, {day:'numeric', month:'long', year:'numeric'})} · что делать?` : '';
+  $('heroWarn').classList.toggle('act', !FX_MISSING && !!neg);
 }
 
 /* ================== Календарь ================== */
@@ -1046,7 +1051,7 @@ function renderAccs(){
     <div class="card"><ul class="list" style="margin:0">
       ${row('main', '💳', 'Основной', main || 0, 'зарплата, расходы и прогноз')}
       ${SHARED ? row('me', '🕶️', 'Личный счёт', accBal('me', SEL), 'видите только вы') : ''}
-      ${list.map(a => row(a.id, a.icon, a.name, accBal(a.id, SEL), (PRIV.accounts || []).includes(a) ? '🕶️ личная, видите только вы' : '')).join('')}
+      ${list.map(a => row(a.id, a.icon, a.name, accBal(a.id, SEL), (PRIV.accounts || []).includes(a) ? '🕶️ личная, видите только вы' : a.goal ? `цель ${fmtMoney(a.goal.amount)} к ${fmtDate(a.goal.date, {day:'numeric', month:'short', year:'numeric'})} · ${Math.max(0, Math.min(100, Math.round(accBal(a.id, t) / a.goal.amount * 100)))}%` : '')).join('')}
     </ul></div>
     ${list.length ? '' : '<p class="empty-note" style="margin:0 0 12px">Создайте счёт для накоплений — например, «🏖 Отпуск» или «🏠 Квартира» — и переводите туда деньги с основного.</p>'}
     <div class="actions">
@@ -1089,11 +1094,14 @@ function renderRules(){
     }
     html += '</div>';
   }
+  const hints = calibrationHints();
+  if (hints.length) html = `<div class="card pad"><b>💡 Прогноз расходится с фактом</b>${hints.map((h, i) => `<p class="hint" style="margin:8px 0 6px">${esc(h.text)}</p><button class="btn soft" data-hint="${i}">${esc(h.action)}</button>`).join('')}</div>` + html;
   html += `<button class="btn block" id="addRule">Добавить регулярный доход или платёж</button>
     <p class="hint" style="margin-top:12px">Суммы проставляются наперёд каждый месяц. Если поменять сумму «с этого месяца и дальше», все следующие месяцы пересчитаются с новой суммой.</p>`;
   $('tab-rules').innerHTML = html;
   $('tab-rules').querySelectorAll('[data-rule]').forEach(el => el.onclick = () => editRule(S.rules.find(r => r.id === el.dataset.rule)));
   $('addRule').onclick = () => editRule(null);
+  $('tab-rules').querySelectorAll('[data-hint]').forEach(el => el.onclick = () => { hints[+el.dataset.hint].apply(); haptic('success'); commit(); toast('Обновлено'); });
 }
 
 /* ================== Статистика ================== */
@@ -1404,6 +1412,11 @@ function renderMore(){
       <p class="hint" style="margin:4px 0 10px">Введите, сколько денег у вас реально есть сейчас, — прогноз пересчитается от этой суммы. Сейчас учёт идёт с ${fmtDate(S.start.date)} от ${fmtMoney(S.start.balance)}.</p>
       <button class="btn" id="reconcile">Сверить остаток</button>
     </div>
+    ${AIOK ? `<div class="card pad">
+      <b>🔮 Что если…</b>
+      <p class="hint" style="margin:4px 0 10px">Опишите кредит, смену зарплаты или цель накопления словами — покажу, как изменится прогноз, и применю после вашего подтверждения.</p>
+      <button class="btn" id="aiAsk">Спросить</button>
+    </div>` : ''}
     <div class="card pad">
       <b>Когда смогу купить?</b>
       <p class="hint" style="margin:4px 0 10px">Найду самый ранний день, когда покупка не уведёт вас в минус ни в один из следующих дней.</p>
@@ -1438,6 +1451,7 @@ function renderMore(){
   if ($('invite')) $('invite').onclick = invite;
   if ($('leave')) $('leave').onclick = leaveShared;
   $('canBuy').onclick = canBuySheet;
+  if ($('aiAsk')) $('aiAsk').onclick = aiAskSheet;
   $('fxUpd').onclick = () => refreshRates(true);
   $('baseCur').onchange = e => changeBase(e.target.value);
   $('horizon').onchange = e => {
@@ -1599,7 +1613,8 @@ function accountSheet(a){
     <h2>${esc(a.icon)} ${esc(a.name)}</h2>
     <p class="hint" style="margin:-6px 0 12px">${SEL === t ? 'Сейчас' : 'На ' + fmtDate(SEL, {day:'numeric', month:'long', year:'numeric'})}: <b class="num">${fmtMoney(accBal(a.id, SEL))}</b></p>
     <div class="actions" style="margin:0 0 4px"><button class="btn" id="a_in">＋ Пополнить</button><button class="btn soft" id="a_out">Снять</button></div>
-    ${(S.accounts || []).includes(a) ? `<button class="btn soft block" id="a_cats" style="margin-top:12px">🏷️ Категории расходов${linkedCats(a.id).length ? ' (' + linkedCats(a.id).length + ')' : ''}</button>
+    ${(S.accounts || []).includes(a) ? `<button class="btn soft block" id="a_goal" style="margin-top:12px">🎯 Цель и план накопления</button>
+    <button class="btn soft block" id="a_cats" style="margin-top:12px">🏷️ Категории расходов${linkedCats(a.id).length ? ' (' + linkedCats(a.id).length + ')' : ''}</button>
     <p class="hint" style="margin:6px 0 0">Расходы привязанных категорий и регулярные платежи со счёта списываются отсюда, а не с основного.</p>` : ''}
     ${hist.length ? `<ul class="list">${hist.slice(0, 40).map((op, i) => {
       if (op.cat !== 'move'){
@@ -1616,6 +1631,7 @@ function accountSheet(a){
     b.querySelector('#a_out').onclick = () => editMove(null, { from: a.id, to: 'main' });
     b.querySelectorAll('[data-h]').forEach(el => el.onclick = () => { const op = hist[+el.dataset.h]; op.cat === 'move' ? editMove(op) : editOp(op); });
     if (b.querySelector('#a_cats')) b.querySelector('#a_cats').onclick = () => linkCatsSheet(a);
+    if (b.querySelector('#a_goal')) b.querySelector('#a_goal').onclick = () => goalSheet(a);
     b.querySelector('#a_edit').onclick = () => editAccount(a);
     b.querySelector('#a_del').onclick = () => deleteAccount(a);
   });
@@ -1842,6 +1858,347 @@ function editRule(rule){
   });
 }
 
+/* ================== Черновики: «что если», план накопления, подсказки ================== */
+// Изменение — простой объект { type, … }. Один и тот же список применяется к копии состояния (прогноз «до/после»)
+// и, после подтверждения, к настоящему состоянию. Модель (ai.py) тоже отдаёт такие объекты, а считает только код.
+const normName = s => String(s || '').toLowerCase().replace(/ё/g, 'е').trim();
+const isYm = s => /^\d{4}-(0[1-9]|1[0-2])$/.test(s || '');
+const isDay = s => /^\d{4}-\d{2}-\d{2}$/.test(s || '') && !isNaN(parse(s));
+const ymLabel = ym => fmtDate(ym + '-01', {month:'long', year:'numeric'});
+function findRule(ref){
+  const n = normName(ref);
+  const like = r => { const x = normName(r.name); return x && n && (x.includes(n) || n.includes(x)); };
+  return S.rules.find(r => r.id === ref) || S.rules.find(r => normName(r.name) === n) || S.rules.find(like);
+}
+// Счёт по id или названию: 'main' / «Основной» — основной; null — такого счёта нет
+function findAccId(ref){
+  const n = normName(ref);
+  if (!n || /^(main|основн)/.test(n)) return 'main';
+  const list = payAccs();
+  const a = list.find(x => x.id === ref) || list.find(x => normName(x.name) === n) || list.find(x => normName(x.name).includes(n) || n.includes(normName(x.name)));
+  return a ? a.id : null;
+}
+// Применяет изменения к текущему S. Возвращает { done: [описания], errors: [причины] }
+function applyChanges(list){
+  const done = [], errors = [], t = today(), curYm = t.slice(0, 7);
+  const accOf = ref => { const a = ref ? findAccId(ref) : 'main'; if (a === null) throw new Error(`Нет счёта «${ref}»`); return a; };
+  const ruleOf = ref => findRule(ref) || (() => { throw new Error(`Не найден платёж «${ref}»`); })();
+  const one = c => {
+    const cy = c.cur && FX[c.cur] ? c.cur : BASE, month = isYm(c.month) ? c.month : curYm;
+    switch (c.type){
+      case 'add_rule': {
+        if (!KINDS[c.kind]) throw new Error('Неизвестный тип платежа');
+        const amount = num(c.amount), day = clampDay(c.day), acc = accOf(c.acc);
+        if (!(amount > 0)) throw new Error('Не указана сумма платежа');
+        const name = String(c.name || KINDS[c.kind].name).slice(0, 60);
+        S.rules.push({ id: uid(), kind: c.kind, name, v: [{ from: month, amount, day, ...curOpt(cy), ...accOpt(acc) }] });
+        return `${KINDS[c.kind].icon} ${KINDS[c.kind].sign > 0 ? 'Доход' : 'Платёж'} «${name}»: ${fmtCur(amount, cy)}, ${day}-го числа, с ${ymLabel(month)}`;
+      }
+      case 'change_rule': {
+        const r = ruleOf(c.rule), v0 = versionFor(r, month) || r.v[0];
+        if (v0.stop) throw new Error(`«${r.name}» уже остановлен`);
+        const nv = { ...v0 }; delete nv.from;
+        const parts = [];
+        if (c.amount != null && num(c.amount) > 0){ nv.amount = num(c.amount); if (c.cur && FX[c.cur]){ delete nv.cur; Object.assign(nv, curOpt(cy)); } parts.push('сумма ' + fmtCur(nv.amount, nv.cur)); }
+        if (c.day != null){ nv.day = clampDay(c.day); parts.push(nv.day + '-го числа'); }
+        if (c.acc){ delete nv.acc; Object.assign(nv, accOpt(accOf(c.acc))); parts.push('счёт ' + accLabel(accOf(c.acc))); }
+        if (!parts.length) throw new Error(`Для «${r.name}» не указано, что менять`);
+        setFrom(r, month, nv);
+        return `✏️ «${r.name}» с ${ymLabel(month)}: ${parts.join(', ')}`;
+      }
+      case 'stop_rule': {
+        const r = ruleOf(c.rule); setFrom(r, month, { stop: true });
+        return `⏹ «${r.name}» не повторяется с ${ymLabel(month)}`;
+      }
+      case 'skip_month': {
+        const r = ruleOf(c.rule); S.ov[r.id + '|' + month] = { skip: true };
+        return `⏭ «${r.name}» пропущен в ${ymLabel(month)}`;
+      }
+      case 'add_op': {
+        const amount = num(c.amount);
+        if (!isDay(c.date)) throw new Error('Не указана дата операции');
+        if (!isFinite(amount) || amount === 0) throw new Error('Не указана сумма операции');
+        const cat = (amount < 0 ? allCats() : INCOME_CATS)[c.cat] ? c.cat : amount < 0 ? 'other' : 'inc';
+        const acc = c.acc ? accOf(c.acc) : undefined;
+        S.ops.push({ id: uid(), ts: Date.now(), date: c.date, amount, cat, note: String(c.note || '').slice(0, 80), ...curOpt(cy), ...(acc ? { acc } : {}) });
+        return `${amount < 0 ? '➖' : '➕'} ${fmtDate(c.date)}: ${fmtCur(Math.abs(amount), cy)}${c.note ? ' · ' + c.note : ''}`;
+      }
+      case 'add_move': {
+        const from = accOf(c.from_acc || c.from), to = accOf(c.to_acc || c.to), amount = num(c.amount);
+        if (from === to) throw new Error('Перевод на тот же счёт');
+        if (!(amount > 0)) throw new Error('Не указана сумма перевода');
+        if (!isDay(c.date)) throw new Error('Не указана дата перевода');
+        pushMove({ id: uid(), ts: Date.now(), date: c.date, cat: 'move', from, to, amount, note: String(c.note || ''), ...curOpt(cy) });
+        return `⇄ ${fmtDate(c.date)}: ${accLabel(from)} → ${accLabel(to)}, ${fmtCur(amount, cy)}`;
+      }
+      case 'move_op': {
+        const op = S.ops.find(o => o.id === c.op);
+        if (!op || !isDay(c.date)) throw new Error('Не удалось перенести запись');
+        const old = op.date; op.date = c.date;
+        return `📅 «${op.note || catOf(op.cat).n}» перенесена с ${fmtDate(old)} на ${fmtDate(c.date)}`;
+      }
+      case 'delete_op': {
+        S.ops = S.ops.filter(o => o.id !== c.op); return 'удалена запись';
+      }
+      default: throw new Error('Неизвестное изменение');
+    }
+  };
+  for (const c of list || []){ try { done.push(one(c || {})); } catch(e){ errors.push(e.message); } }
+  return { done, errors };
+}
+
+// Выполняет fn() на копии состояния с применёнными изменениями; настоящее состояние не трогается
+function withDraft(changes, fn){
+  const keep = S, clone = JSON.parse(JSON.stringify(S));
+  S = clone;
+  try { const log = applyChanges(changes); rebuild(); return fn(log); }
+  finally { S = keep; rebuild(); }
+}
+// Показатели прогноза основного счёта (по текущему EV/BAL)
+function forecastMetrics(){
+  const t = today(), d0 = parse(t);
+  let min = Infinity, minD = null;
+  for (let i = 0; i <= RANGE; i++){ const d = addDays(t, i), b = balOn(d); if (b != null && b < min){ min = b; minD = d; } }
+  const endOf = k => { const x = ymOf(d0.getFullYear(), d0.getMonth() + k); return balOn(lastDay(x.y, x.m)); };
+  return { now: balOn(t), neg: firstNegative(), min: min === Infinity ? null : min, minD, m1: endOf(0), m3: endOf(2), m6: endOf(5), m12: endOf(11) };
+}
+function simulate(changes){
+  const before = forecastMetrics();
+  return withDraft(changes, log => ({ before, after: forecastMetrics(), ...log }));
+}
+
+/* Карточка «до / после» с кнопкой применить */
+function scenarioSheet(title, changes, opts = {}){
+  const r = simulate(changes), b = r.before, a = r.after;
+  const money = v => v == null ? '—' : fmtMoney(v);
+  const negTxt = m => m.neg ? fmtDate(m.neg, {day:'numeric', month:'long'}) : 'нет';
+  const row = (label, x, y, bad) => `<tr><td>${label}</td><td class="num">${x}</td><td class="num ${bad ? 'negc' : ''}">${y}</td></tr>`;
+  openSheet(`
+    <h2>${esc(title)}</h2>
+    ${opts.summary ? `<p class="hint" style="margin:-6px 0 10px">${esc(opts.summary)}</p>` : ''}
+    ${r.done.length ? `<ul class="list">${r.done.map(x => `<li class="row"><span class="t">${esc(x)}</span></li>`).join('')}</ul>` : ''}
+    ${r.errors.length ? `<p class="hint" style="color:var(--red)">${r.errors.map(esc).join('<br>')}</p>` : ''}
+    ${r.done.length ? `<table class="cmp"><tr><th></th><th>Сейчас</th><th>После</th></tr>
+      ${row('Уход в минус', negTxt(b), negTxt(a), a.neg && !b.neg)}
+      ${row('Минимум остатка', money(b.min), money(a.min), a.min != null && a.min < 0)}
+      ${row('В конце месяца', money(b.m1), money(a.m1))}
+      ${row('Через 3 мес.', money(b.m3), money(a.m3))}
+      ${row('Через 6 мес.', money(b.m6), money(a.m6))}
+      ${row('Через 12 мес.', money(b.m12), money(a.m12))}</table>` : ''}
+    ${r.done.length ? '<button class="btn block" id="f_apply">Применить</button>' : ''}
+    <button class="btn soft block" id="f_close">${r.done.length ? 'Не применять' : 'Закрыть'}</button>`,
+  bd => {
+    const ap = bd.querySelector('#f_apply');
+    if (ap) ap.onclick = () => {
+      const res = applyChanges(changes);
+      if (opts.onApply) opts.onApply();
+      haptic('success'); closeSheet(); commit();
+      if (changes.some(c => c.cur)) freezeOps();
+      toast(res.errors.length ? 'Применено частично' : 'Применено');
+    };
+    bd.querySelector('#f_close').onclick = closeSheet;
+  });
+}
+
+/* ---------- Что делать, если прогноз уходит в минус ---------- */
+function fixOptions(){
+  const neg = firstNegative(), t = today();
+  if (!neg) return [];
+  const out = [];
+  const check = (title, changes) => {
+    const r = simulate(changes);
+    if (r.errors.length || !r.done.length) return;
+    if (r.after.neg && r.after.neg <= neg) return;                // не помогло
+    out.push({ title, changes, full: !r.after.neg, after: r.after });
+  };
+  // 1. Отложить запланированную покупку
+  for (const op of S.ops.filter(o => o.cat === 'plan' && o.date >= t && o.amount < 0)){
+    const d = withDraft([{ type: 'delete_op', op: op.id }], () => whenCanBuy(-toBase(op.amount, op.cur, op.rate), 0));
+    if (d && d > op.date) check(`Отложить «${op.note || 'покупку'}» на ${fmtDate(d)}`, [{ type: 'move_op', op: op.id, date: d }]);
+  }
+  // 2. Покрыть провал со счёта-копилки
+  let deficit = 0;
+  for (let i = 0; i <= 45; i++){ const b = balOn(addDays(neg, i)); if (b != null && b < 0) deficit = Math.max(deficit, -b); }
+  const need = Math.ceil(deficit / 10) * 10, when = addDays(neg, -1) < t ? t : addDays(neg, -1);
+  for (const a of payAccs()) if (need > 0 && accBal(a.id, when) >= need)
+    check(`Перевести ${fmtMoney(need)} с «${a.name}» на основной ${fmtDate(when)}`, [{ type: 'add_move', date: when, from_acc: a.id, to_acc: 'main', amount: need, note: 'Покрытие минуса' }]);
+  // 3. Пропустить один регулярный расход до даты минуса
+  const seen = new Set();
+  for (let i = 0; i <= Math.min(RANGE, 90); i++){
+    const d = addDays(t, i); if (d > neg) break;
+    for (const e of EV.get(d) || []) if (e.rule && e.amount < 0 && e.acc === 'main' && !seen.has(e.rule.id + e.ym)){
+      seen.add(e.rule.id + e.ym);
+      check(`Пропустить «${e.rule.name}» в ${ymLabel(e.ym)} (${fmtMoney(-e.amount)})`, [{ type: 'skip_month', rule: e.rule.id, month: e.ym }]);
+    }
+  }
+  out.sort((x, y) => (y.full ? 1 : 0) - (x.full ? 1 : 0));
+  return out.slice(0, 5);
+}
+function fixSheet(){
+  const neg = firstNegative();
+  if (!neg) return;
+  const opts = fixOptions();
+  openSheet(`
+    <h2>⚠️ Уход в минус ${fmtDate(neg, {day:'numeric', month:'long', year:'numeric'})}</h2>
+    <p class="hint" style="margin:-6px 0 12px">Минимум на основном счёте: <b class="num">${fmtMoney(forecastMetrics().min)}</b>. Варианты, которые я проверил расчётом:</p>
+    ${opts.length ? `<ul class="list">${opts.map((o, i) => `<li class="row" data-i="${i}"><span class="t">${esc(o.title)}<small>${o.full ? 'минус уходит совсем' : 'минус сдвигается на ' + fmtDate(o.after.neg, {day:'numeric', month:'long'})}</small></span><span class="a">›</span></li>`).join('')}</ul>`
+      : '<p class="empty-note">Простых вариантов нет: нужно сократить расходы или увеличить доход. Попробуйте сценарий «что если».</p>'}`,
+  b => b.querySelectorAll('[data-i]').forEach(el => el.onclick = () => { const o = opts[+el.dataset.i]; scenarioSheet(o.title, o.changes); }));
+}
+
+/* ---------- План накопления под цель ---------- */
+// Даты переводов: по одному в месяц, в день ближайшего дохода (или 10-го), после сегодня и не позже byDate
+function transferDates(byDate){
+  const t = today(), d0 = parse(t), out = [];
+  let cur = ymOf(d0.getFullYear(), d0.getMonth());
+  while (`${cur.y}-${pad(cur.m + 1)}-01` <= byDate){
+    let day = null;
+    for (const r of S.rules){ if (KINDS[r.kind].sign < 0) continue; const o = occurrence(r, cur.y, cur.m); if (o && (!day || o.date < day)) day = o.date; }
+    day = day || `${cur.y}-${pad(cur.m + 1)}-${pad(Math.min(10, daysInMonth(cur.y, cur.m)))}`;
+    if (day > t && day <= byDate) out.push(day);
+    cur = ymOf(cur.y, cur.m + 1);
+  }
+  return out;
+}
+function planSavings(accId, target, byDate, buffer){
+  const t = today(), have = accBal(accId, t), need = target - have;
+  if (need <= 0.005) return { done: true, have };
+  const dates = transferDates(byDate);
+  if (!dates.length) return { error: 'До этой даты не осталось дней зарплаты для переводов' };
+  const mk = x => dates.map(d => ({ type: 'add_move', date: d, from_acc: 'main', to_acc: accId, amount: x, note: 'План накопления' }));
+  const end = addDays(byDate, 31);
+  const ok = x => withDraft(mk(x), () => { for (let d = t; d <= end; d = addDays(d, 1)){ const b = balOn(d); if (b != null && b < buffer - 0.005) return false; } return true; });
+  const wanted = Math.ceil(need / dates.length / 5) * 5;
+  if (ok(wanted)) return { ok: true, amount: wanted, count: dates.length, changes: mk(wanted), need, have };
+  if (!ok(0)) return { ok: false, max: 0, count: dates.length, need, have, changes: [] };
+  let lo = 0, hi = wanted;
+  while (hi - lo > 1){ const mid = Math.floor((lo + hi) / 2); if (ok(mid)) lo = mid; else hi = mid; }
+  return { ok: false, max: lo, count: dates.length, need, have, changes: lo > 0 ? mk(lo) : [], reach: lo * dates.length + have };
+}
+function goalSheet(a){
+  const t = today(), d0 = parse(t), def = a.goal || {};
+  openSheet(`
+    <h2>🎯 Цель: ${esc(a.icon)} ${esc(a.name)}</h2>
+    <p class="hint" style="margin:-6px 0 12px">Сейчас на счёте ${fmtMoney(accBal(a.id, t))}. Рассчитаю, сколько откладывать в день зарплаты, чтобы основной счёт не ушёл в минус.</p>
+    <div class="two">${amtField('Сколько накопить', 'f_a', def.amount || '', BASE, '')}<label class="field"><span>К дате</span><input id="f_d" type="date" value="${def.date || addDays(t, 180)}"></label></div>
+    ${amtField('Не опускать основной счёт ниже', 'f_b', '', BASE, '')}
+    <button class="btn block" id="f_go">Рассчитать</button>
+    <div id="f_res"></div>`,
+  b => b.querySelector('#f_go').onclick = () => {
+    const target = num(b.querySelector('#f_a').value), by = b.querySelector('#f_d').value, buf = num(b.querySelector('#f_b').value) || 0;
+    if (!(target > 0)) return toast('Введите сумму цели');
+    if (!isDay(by) || by <= t) return toast('Выберите дату в будущем');
+    const p = planSavings(a.id, target, by, buf), res = b.querySelector('#f_res');
+    if (p.error) { res.innerHTML = `<div class="result">${esc(p.error)}</div>`; return; }
+    if (p.done) { res.innerHTML = `<div class="result">Цель уже достигнута: на счёте ${fmtMoney(p.have)}.</div>`; return; }
+    const save = () => { a.goal = { amount: target, date: by }; };
+    if (p.ok){
+      res.innerHTML = `<div class="result">Откладывайте <b>${fmtMoney(p.amount)}</b> в день зарплаты, ${p.count} ${p.count === 1 ? 'раз' : 'раз'} до ${fmtDate(by, {day:'numeric', month:'long', year:'numeric'})}. Не хватает ${fmtMoney(p.need)}.
+        <button class="btn soft block" id="f_view">Посмотреть, как изменится прогноз</button></div>`;
+      res.querySelector('#f_view').onclick = () => scenarioSheet('План накопления', p.changes, { onApply: save });
+    } else {
+      res.innerHTML = `<div class="result">${p.max > 0
+        ? `К ${fmtDate(by, {day:'numeric', month:'long'})} получится собрать только ${fmtMoney(p.reach)} из ${fmtMoney(target)}: можно откладывать максимум <b>${fmtMoney(p.max)}</b> за раз. Чтобы успеть, сдвиньте дату или цель.
+           <button class="btn soft block" id="f_view">Составить план на максимум</button>`
+        : 'С таким запасом откладывать не получится: основной счёт и так уходит ниже порога. Уменьшите запас или сначала уберите минус.'}</div>`;
+      const v = res.querySelector('#f_view');
+      if (v) v.onclick = () => scenarioSheet('План накопления (максимум)', p.changes, { onApply: save });
+    }
+  });
+}
+
+
+/* ---------- «Что если…» через ИИ ---------- */
+// В запрос уходит только сводка: платежи, названия счетов и категорий. Операции и инкогнито-записи не отправляются.
+function aiContext(){
+  const t = today(), ym = t.slice(0, 7);
+  return {
+    today: t, currency: BASE,
+    rules: S.rules.map(r => { const v = versionFor(r, ym) || r.v[0]; return { name: r.name, kind: r.kind, amount: v.amount, cur: v.cur || BASE, day: v.day, stopped: !!v.stop, acc: evAcc(v.acc, t) === 'main' ? 'Основной' : accLabel(v.acc).replace(/^\S+\s/, '') }; }),
+    accounts: ['Основной', ...payAccs().map(a => a.name)],
+    categories: sortedExpenseCats().map(([k, c]) => ({ key: k, name: c.n })),
+  };
+}
+const AI_ERRORS = { ai_off: 'ИИ вам недоступен', limit_day: 'Дневной лимит запросов исчерпан, попробуйте завтра', limit_month: 'Месячный лимит запросов исчерпан',
+  ai_busy: 'ИИ сейчас перегружен, повторите через минуту', ai_offline: 'Нет связи с ИИ, повторите позже', ai_error: 'Ошибка ИИ, повторите позже',
+  ai_bad_answer: 'ИИ ответил непонятно, переформулируйте фразу', bad_text: 'Фраза пустая или слишком длинная (до 400 знаков)', bad_context: 'Слишком много данных в календаре для запроса' };
+function aiAskSheet(){
+  openSheet(`
+    <h2>🔮 Что если…</h2>
+    <p class="hint" style="margin:-6px 0 12px">Опишите изменение своими словами — я посчитаю, как оно повлияет на прогноз. Ничего не изменится, пока вы не нажмёте «Применить». В ИИ уходят только платежи, названия счетов и категорий, без отдельных операций.</p>
+    <label class="field"><span>Например: «с марта кредит 400 в месяц 5-го числа» или «накопить 3000 на отпуск к июлю»</span><textarea id="f_q" rows="3" maxlength="400" style="width:100%;box-sizing:border-box;padding:10px;border-radius:10px;border:0;background:var(--bg2);color:var(--text);font:inherit"></textarea></label>
+    <button class="btn block" id="f_go">Посчитать</button>`,
+  b => {
+    const go = b.querySelector('#f_go');
+    go.onclick = async () => {
+      const text = b.querySelector('#f_q').value.trim();
+      if (!text) return toast('Опишите, что изменится');
+      go.disabled = true; go.textContent = 'Думаю…';
+      try {
+        const r = await api('ai', { text, context: aiContext() });
+        if (r.status !== 200){ toast(AI_ERRORS[r.data.error] || 'Не получилось, повторите позже'); return; }
+        aiResult(r.data);
+      } catch(e){ console.error(e); toast('Нет связи с сервером'); }
+      finally { go.disabled = false; go.textContent = 'Посчитать'; }
+    };
+  });
+}
+// Ответ ИИ → изменения; цель накопления раскрывается в переводы расчётом приложения
+function aiResult(data){
+  const changes = [], notes = [], goals = [];
+  for (const c of data.changes || []){
+    if (c.type !== 'savings_goal'){ changes.push(c); continue; }
+    const id = findAccId(c.acc), target = num(c.amount);
+    if (id === null || id === 'main' || !(target > 0) || !isDay(c.date)){ notes.push('Цель накопления не распознана: проверьте название счёта, сумму и дату.'); continue; }
+    const p = planSavings(id, target, c.date, 0);
+    if (p.error) notes.push(p.error);
+    else if (p.done) notes.push('Цель уже достигнута.');
+    else {
+      changes.push(...p.changes); goals.push({ id, amount: target, date: c.date });
+      if (!p.ok) notes.push(`К ${fmtDate(c.date)} получится собрать ${fmtMoney(p.reach)} из ${fmtMoney(target)}: основной счёт уйдёт в минус при больших переводах.`);
+    }
+  }
+  const summary = [data.summary, ...notes].filter(Boolean).join(' ');
+  if (!changes.length){ openSheet(`<h2>🔮 Что если…</h2><p class="hint">${esc(summary || 'Не удалось понять фразу.')}</p><button class="btn block" id="f_close">Закрыть</button>`, b => b.querySelector('#f_close').onclick = closeSheet); return; }
+  scenarioSheet('Что если…', changes, { summary, onApply: () => goals.forEach(g => { const a = accById(g.id); if (a) a.goal = { amount: g.amount, date: g.date }; }) });
+}
+
+/* ---------- Подсказки: насколько прогноз расходится с фактом ---------- */
+function calibrationHints(){
+  const t = today(), d0 = parse(t), cur = t.slice(0, 7), hints = [];
+  const prev = [3, 2, 1].map(k => { const x = ymOf(d0.getFullYear(), d0.getMonth() - k); return ymKey(x.y, x.m); });
+  for (const r of S.rules){
+    const v = versionFor(r, cur);
+    if (!v || v.stop) continue;
+    // 1. Одну и ту же сумму несколько месяцев подряд правили вручную
+    const diffs = [];
+    for (const ym of prev){
+      const o = S.ov[r.id + '|' + ym], pv = versionFor(r, ym);
+      if (o && o.amount != null && pv && !pv.stop && (o.cur || BASE) === (v.cur || BASE) && (pv.cur || BASE) === (v.cur || BASE)) diffs.push({ plan: pv.amount, fact: o.amount });
+    }
+    if (diffs.length >= 2){
+      const plan = diffs.reduce((s, x) => s + x.plan, 0) / diffs.length, fact = diffs.reduce((s, x) => s + x.fact, 0) / diffs.length;
+      const same = diffs.every(x => Math.sign(x.fact - x.plan) === Math.sign(diffs[0].fact - diffs[0].plan));
+      const rounded = Math.round(fact);
+      if (same && plan > 0 && Math.abs(fact - plan) / plan > 0.05 && rounded !== v.amount)
+        hints.push({ key: r.id + ':amt', text: `«${r.name}»: последние ${diffs.length} мес. вы правили сумму вручную — в среднем ${fmtCur(rounded, v.cur)} вместо ${fmtCur(v.amount, v.cur)}.`,
+          action: `Обновить с ${ymLabel(cur)}`, apply: () => { const nv = { ...v, amount: rounded }; delete nv.from; setFrom(r, cur, nv); } });
+    }
+    // 2. Коммуналка: по факту (категория «Коммунальные») отличается от заложенной
+    if (KINDS[r.kind].util){
+      const sums = prev.map(ym => S.ops.filter(o => o.cat === 'util' && o.amount < 0 && o.date.startsWith(ym)).reduce((s, o) => s - toBase(o.amount, o.cur, o.rate), 0)).filter(x => x > 0);
+      const planned = toBase(v.util || 0, v.ucur);
+      if (sums.length >= 2){
+        const avg = Math.round(sums.reduce((s, x) => s + x, 0) / sums.length);
+        if (avg > 0 && Math.abs(avg - planned) / Math.max(planned, 1) > 0.1)
+          hints.push({ key: r.id + ':util', text: `Коммуналка по записям в среднем ${fmtMoney(avg)} в месяц (за ${sums.length} мес.), а в прогнозе заложено ${fmtMoney(planned)}.`,
+            action: `Поставить ${fmtMoney(avg)} с ${ymLabel(cur)}`, apply: () => { const nv = { ...v, util: avg }; delete nv.from; delete nv.ucur; setFrom(r, cur, nv); } });
+      }
+    }
+  }
+  return hints;
+}
+
 function reconcile(){
   const now = balOn(today());
   openSheet(`
@@ -1915,6 +2272,7 @@ function onboarding(){
 }
 
 /* ================== События интерфейса ================== */
+$('heroWarn').onclick = () => { if (!FX_MISSING && firstNegative()) fixSheet(); };
 slider.addEventListener('input', () => {
   setSliderFill();
   const d = addDays(today(), +slider.value);
