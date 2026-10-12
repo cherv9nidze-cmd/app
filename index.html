@@ -174,6 +174,7 @@ input[type=range]:focus-visible{outline:2px solid var(--accent);outline-offset:4
 .switch input{width:22px;height:22px;accent-color:var(--accent)}
 .result{margin-top:12px;padding:12px;border-radius:12px;background:var(--bg2)}
 .draftbar{position:sticky;top:0;z-index:20;display:flex;flex-wrap:wrap;align-items:center;gap:6px 8px;padding:8px 12px;background:var(--accent);color:var(--accent-text);font-size:14px}.draftbar .grow{flex:1}.draftbar button{border:0;border-radius:10px;padding:6px 11px;font:inherit;font-weight:600;cursor:pointer;background:rgba(255,255,255,.22);color:inherit}.draftbar button.go{background:var(--accent-text);color:var(--accent)}
+.draftbar .seg2{display:flex;background:rgba(0,0,0,.22);border-radius:10px;padding:2px}.draftbar .seg2 button{background:none;padding:5px 10px}.draftbar .seg2 button.on{background:var(--accent-text);color:var(--accent)}
 .drafting .hero{box-shadow:inset 0 0 0 2px var(--accent)}
 .chat{max-height:34vh;overflow:auto;margin:0 0 10px}.msg{margin:6px 0;padding:8px 11px;border-radius:12px;font-size:14px;max-width:92%;white-space:pre-wrap}.msg.u{background:var(--accent);color:var(--accent-text);margin-left:auto}.msg.a{background:var(--bg2)}
 .toast{position:fixed;left:50%;bottom:90px;transform:translateX(-50%);background:var(--text);color:var(--bg);padding:10px 16px;border-radius:12px;font-size:14px;z-index:30}
@@ -1426,7 +1427,7 @@ function renderMore(){
     </div>
     ${AIOK ? `<div class="card pad">
       <b>🔮 Что если…</b>
-      <p class="hint" style="margin:4px 0 10px">Опишите кредит, смену зарплаты или цель накопления словами. Изменения сразу покажутся в календаре как черновик; их можно уточнять в чате и слить в календарь, когда всё устроит.</p>
+      <p class="hint" style="margin:4px 0 10px">Опишите кредит, смену зарплаты или цель накопления словами. Изменения покажутся в отдельном календаре-черновике, основной не меняется. Их можно уточнять в чате и слить в основной после проверки.</p>
       <button class="btn" id="aiAsk">${CHAT.length ? 'Продолжить чат' : 'Спросить'}</button>
     </div>` : ''}
     <div class="card pad">
@@ -2166,14 +2167,22 @@ function persistDraft(){
 }
 function setDraft(ai){
   if (!REAL) REAL = S;
-  const before = DRAFT ? DRAFT.before : (rebuild(), forecastMetrics());     // «Сейчас» — по настоящим данным
+  const before = DRAFT ? DRAFT.before : (S = REAL, rebuild(), forecastMetrics());     // «Сейчас» — по настоящим данным
   S = REAL;
   const ex = expandAi(ai);
-  S = JSON.parse(JSON.stringify(REAL));
+  const copy = JSON.parse(JSON.stringify(REAL));
+  S = copy;
   const log = applyChanges(ex.changes);
   for (const g of ex.goals){ const a = accById(g.id); if (a) a.goal = { amount: g.amount, date: g.date }; }
-  DRAFT = { ai, changes: ex.changes, goals: ex.goals, notes: ex.notes, done: log.done, errors: log.errors, before };
+  rebuild();
+  DRAFT = { ai, changes: ex.changes, goals: ex.goals, notes: ex.notes, done: log.done, errors: log.errors, before, after: forecastMetrics(), S: copy, view: 'draft' };
   persistDraft(); renderAll();
+}
+// Переключатель «Основной / Черновик»: оба календаря только для просмотра, пока черновик не слит или не отменён
+function showView(v){
+  if (!DRAFT) return;
+  DRAFT.view = v; S = v === 'draft' ? DRAFT.S : REAL;
+  renderAll(); selectDate(SEL);
 }
 function leaveDraft(merge){
   if (!DRAFT) return;
@@ -2188,10 +2197,29 @@ function leaveDraft(merge){
   } else { renderAll(); toast('Черновик отменён'); }
   pullInbox();
 }
-async function mergeDraft(){
+// Слияние в два шага: сначала экран «что будет изменено», потом подтверждение на нём
+function mergeDraft(){
   if (!DRAFT) return;
-  const n = DRAFT.done.length;
-  if (await ask(`Слить ${n} ${n === 1 ? 'изменение' : 'изменений'} в календарь? Данные будут изменены${SHARED ? ' и станут видны второму участнику' : ''}.`)){ closeSheet(); leaveDraft(true); }
+  const t = DRAFT, a = t.after, b = t.before;
+  if (!t.done.length) return toast('В черновике нет изменений для слияния');
+  const money = v => v == null ? '—' : fmtMoney(v);
+  const negTxt = m => m.neg ? fmtDate(m.neg, {day:'numeric', month:'long'}) : 'нет';
+  openSheet(`
+    <h2>Слить в основной календарь?</h2>
+    <p class="hint" style="margin:-6px 0 10px">В основном календаре будет изменено:</p>
+    <ul class="list">${t.done.map(x => `<li class="row"><span class="t">${esc(x)}</span></li>`).join('')}</ul>
+    ${t.errors.length ? `<p class="hint" style="color:var(--red)">Не будет применено:<br>${t.errors.map(esc).join('<br>')}</p>` : ''}
+    <table class="cmp"><tr><th></th><th>Сейчас</th><th>После слияния</th></tr>
+      <tr><td>Уход в минус</td><td class="num">${negTxt(b)}</td><td class="num ${a.neg && !b.neg ? 'negc' : ''}">${negTxt(a)}</td></tr>
+      <tr><td>Минимум остатка</td><td class="num">${money(b.min)}</td><td class="num">${money(a.min)}</td></tr>
+      <tr><td>Через 6 мес.</td><td class="num">${money(b.m6)}</td><td class="num">${money(a.m6)}</td></tr></table>
+    <p class="hint">${SHARED ? 'Изменения сразу станут видны второму участнику. ' : ''}Вернуть прежние значения после слияния можно только вручную.</p>
+    <button class="btn block" id="f_ok">Слить в основной календарь</button>
+    <button class="btn soft block" id="f_back">Вернуться к черновику</button>`,
+  bd => {
+    bd.querySelector('#f_ok').onclick = () => { closeSheet(); leaveDraft(true); };
+    bd.querySelector('#f_back').onclick = closeSheet;
+  }, { draft: true });
 }
 async function cancelDraft(){
   if (!DRAFT && !CHAT.length) return;
@@ -2199,9 +2227,11 @@ async function cancelDraft(){
 }
 function renderDraftBar(){
   const el = $('draftBar');
-  el.hidden = !DRAFT; document.body.classList.toggle('drafting', !!DRAFT);
+  el.hidden = !DRAFT; document.body.classList.toggle('drafting', !!DRAFT && DRAFT.view === 'draft');
   if (!DRAFT) return;
-  el.innerHTML = `<b>🔮 Черновик</b><span>${DRAFT.done.length} изм.</span><span class="grow"></span><button id="dChat">Чат</button><button id="dMerge" class="go">Слить</button><button id="dCancel">Отмена</button>`;
+  const v = DRAFT.view;
+  el.innerHTML = `<div class="seg2"><button id="dvReal" class="${v === 'real' ? 'on' : ''}">Основной</button><button id="dvDraft" class="${v === 'draft' ? 'on' : ''}">Черновик · ${DRAFT.done.length}</button></div><span class="grow"></span><button id="dChat">Чат</button><button id="dMerge" class="go">Слить</button><button id="dCancel">Отмена</button>`;
+  $('dvReal').onclick = () => showView('real'); $('dvDraft').onclick = () => showView('draft');
   $('dChat').onclick = chatSheet; $('dMerge').onclick = mergeDraft; $('dCancel').onclick = cancelDraft;
 }
 // Восстановление черновика после перезапуска приложения: изменения применяются заново к текущим данным
@@ -2216,13 +2246,13 @@ function restoreDraft(){
 
 /* ---------- Чат с ИИ: можно уточнять, ответ пересобирает черновик ---------- */
 function chatSheet(){
-  const t = DRAFT ? DRAFT : null, a = t ? forecastMetrics() : null, b = t ? t.before : null;
+  const t = DRAFT ? DRAFT : null, a = t ? t.after : null, b = t ? t.before : null;
   const money = v => v == null ? '—' : fmtMoney(v);
   const negTxt = m => m.neg ? fmtDate(m.neg, {day:'numeric', month:'long'}) : 'нет';
   const row = (label, x, y, bad) => `<tr><td>${label}</td><td class="num">${x}</td><td class="num ${bad ? 'negc' : ''}">${y}</td></tr>`;
   openSheet(`
     <h2>🔮 Что если…</h2>
-    ${CHAT.length ? '' : `<p class="hint" style="margin:-6px 0 10px">Опишите изменение своими словами, например «с ноября кредит 400 в месяц» или «накопить 3000 на счёт Отпуск к июлю». Результат сразу появится в календаре как черновик, его можно уточнять здесь же. Ничего не сохранится, пока вы не нажмёте «Слить». В ИИ уходят только платежи, названия счетов и категорий, без отдельных операций.</p>`}
+    ${CHAT.length ? '' : `<p class="hint" style="margin:-6px 0 10px">Опишите изменение своими словами, например «с ноября кредит 400 в месяц» или «накопить 3000 на счёт Отпуск к июлю». Результат появится в отдельном календаре-черновике (переключатель «Основной / Черновик» сверху), его можно уточнять здесь же. Основной календарь не изменится, пока вы не нажмёте «Слить» и не подтвердите. В ИИ уходят только платежи, названия счетов и категорий, без отдельных операций.</p>`}
     ${CHAT.length ? `<div class="chat" id="chatLog">${CHAT.map(m => `<div class="msg ${m.role === 'user' ? 'u' : 'a'}">${esc(m.text)}</div>`).join('')}</div>` : ''}
     ${t ? `${t.done.length ? `<ul class="list">${t.done.map(x => `<li class="row"><span class="t">${esc(x)}</span></li>`).join('')}</ul>` : ''}
       ${[...t.errors, ...t.notes].length ? `<p class="hint" style="color:var(--red)">${[...t.errors, ...t.notes].map(esc).join('<br>')}</p>` : ''}
