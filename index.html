@@ -173,11 +173,15 @@ input[type=range]:focus-visible{outline:2px solid var(--accent);outline-offset:4
 .switch{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:12px 0}
 .switch input{width:22px;height:22px;accent-color:var(--accent)}
 .result{margin-top:12px;padding:12px;border-radius:12px;background:var(--bg2)}
+.draftbar{position:sticky;top:0;z-index:20;display:flex;flex-wrap:wrap;align-items:center;gap:6px 8px;padding:8px 12px;background:var(--accent);color:var(--accent-text);font-size:14px}.draftbar .grow{flex:1}.draftbar button{border:0;border-radius:10px;padding:6px 11px;font:inherit;font-weight:600;cursor:pointer;background:rgba(255,255,255,.22);color:inherit}.draftbar button.go{background:var(--accent-text);color:var(--accent)}
+.drafting .hero{box-shadow:inset 0 0 0 2px var(--accent)}
+.chat{max-height:34vh;overflow:auto;margin:0 0 10px}.msg{margin:6px 0;padding:8px 11px;border-radius:12px;font-size:14px;max-width:92%;white-space:pre-wrap}.msg.u{background:var(--accent);color:var(--accent-text);margin-left:auto}.msg.a{background:var(--bg2)}
 .toast{position:fixed;left:50%;bottom:90px;transform:translateX(-50%);background:var(--text);color:var(--bg);padding:10px 16px;border-radius:12px;font-size:14px;z-index:30}
 </style>
 </head>
 <body>
 <div id="app">
+  <div class="draftbar" id="draftBar" hidden></div>
   <header class="hero">
     <div class="hero-label" id="heroLabel">Остаток</div>
     <div class="hero-amount num" id="heroAmount">—</div>
@@ -373,7 +377,7 @@ async function loadState(){
 
 let saveTimer = null, saveChain = Promise.resolve();
 function saveState(){
-  if (LOAD_FAILED) return;
+  if (LOAD_FAILED || DRAFT) return;   // пока показан черновик, ничего не пишем: на экране не настоящие данные
   if (SHARED) stampAuthors();
   savePriv();
   clearTimeout(saveTimer);
@@ -381,6 +385,7 @@ function saveState(){
   saveTimer = setTimeout(() => { saveChain = saveChain.then(writeState); }, 300);
 }
 async function writeState(){
+  if (DRAFT) return true;
   if (SHARED) return writeShared();
   const json = JSON.stringify(S);
   try {
@@ -418,6 +423,7 @@ const URLQ = new URLSearchParams(location.search);
 const API = (URLQ.get('api') || '').replace(/\/+$/, '');
 const JOIN = URLQ.get('join');
 let LOCKED = false;   // сервер ответил 403: этого пользователя нет в списке допущенных
+let DRAFT = null, REAL = null, CHAT = [];   // черновик «что если»: S временно заменён копией с изменениями, REAL — настоящие данные
 let AIOK = false;   // сервер разрешил этому пользователю вызовы ИИ (AI_ALLOWED_IDS)
 let SHARED = false, REV = 0, SYNCED = '', MEMBERS = [], ME = 0, writing = false;
 const flag = {   // «этот пользователь в общем календаре» — чтобы при недоступном сервере не открыть личный
@@ -580,7 +586,7 @@ async function writeShared(){
 
 // Раз в 15 секунд (и при возвращении в приложение) подтягиваем правки второго участника
 async function pollShared(){
-  if (!SHARED || LOAD_FAILED || writing || document.hidden || !$('sheet').hidden) return;
+  if (!SHARED || LOAD_FAILED || DRAFT || writing || document.hidden || !$('sheet').hidden) return;
   if (JSON.stringify(S) !== SYNCED){ saveState(); return; }       // прошлая запись не удалась — повторяем
   try {
     const r = await api('me', { since: REV });
@@ -606,6 +612,7 @@ function avatar(id){
 const who = x => { const m = SHARED && x.by && MEMBERS.find(m => m.id === x.by); return m ? `<span class="by">${avatar(m.id)}${esc(m.name.split(' ')[0])}</span>` : ''; };
 
 async function createShared(){
+  if (DRAFT) return toast('Сначала слейте или отмените черновик');
   if (!(await ask('Создать общий календарь из ваших текущих данных? После этого можно пригласить второго человека.'))) return;
   const me = tg.initDataUnsafe && tg.initDataUnsafe.user; if (!me) return;
   stampAuthors(me.id);
@@ -753,7 +760,7 @@ async function changeBase(nb){
 const RATES_ON = new Map();   // кэш курсов по датам на время сессии
 let freezing = false;
 async function freezeOps(){
-  if (LOAD_FAILED || freezing) return;
+  if (LOAD_FAILED || freezing || DRAFT) return;
   freezing = true;
   try {
     const t = today(); let changed = false;
@@ -773,7 +780,7 @@ async function freezeOps(){
   } finally { freezing = false; }
 }
 async function refreshRates(force){
-  if (LOAD_FAILED) return;
+  if (LOAD_FAILED || DRAFT) return;
   if (!force && S.fx && S.fx.checked === today()) return;
   const fx = await fetchRates();
   if (!fx){ if (force) toast('Нацбанк РБ не ответил. Используется последний загруженный курс.'); return; }
@@ -1075,7 +1082,7 @@ function selectDate(ds, fromSlider){
   if (!fromSlider){ slider.value = Math.max(0, Math.min(RANGE, diffDays(ds, today()))); setSliderFill(); }
   renderHero(); renderAccs(); renderCalendar(); renderDay();
 }
-function renderAll(){ rebuild(); renderHero(); renderAccs(); renderCalendar(); renderDay(); renderRules(); renderStats(); renderMore(); }
+function renderAll(){ rebuild(); renderDraftBar(); renderHero(); renderAccs(); renderCalendar(); renderDay(); renderRules(); renderStats(); renderMore(); }
 
 /* ================== Регулярные ================== */
 function renderRules(){
@@ -1094,7 +1101,7 @@ function renderRules(){
     }
     html += '</div>';
   }
-  const hints = calibrationHints();
+  const hints = DRAFT ? [] : calibrationHints();
   if (hints.length) html = `<div class="card pad"><b>💡 Прогноз расходится с фактом</b>${hints.map((h, i) => `<p class="hint" style="margin:8px 0 6px">${esc(h.text)}</p><button class="btn soft" data-hint="${i}">${esc(h.action)}</button>`).join('')}</div>` + html;
   html += `<button class="btn block" id="addRule">Добавить регулярный доход или платёж</button>
     <p class="hint" style="margin-top:12px">Суммы проставляются наперёд каждый месяц. Если поменять сумму «с этого месяца и дальше», все следующие месяцы пересчитаются с новой суммой.</p>`;
@@ -1405,6 +1412,11 @@ function editCat(c, after){
 
 /* ================== Ещё ================== */
 function renderMore(){
+  if (DRAFT){
+    $('tab-more').innerHTML = `<div class="sec-title">Черновик «Что если»</div><div class="card pad"><p class="hint" style="margin:0 0 10px">Приложение показывает черновик: настройки и правки данных недоступны, пока вы его не слили или не отменили.</p><button class="btn" id="dChat2">Открыть чат</button></div>`;
+    $('dChat2').onclick = chatSheet;
+    return;
+  }
   $('tab-more').innerHTML = `
     <div class="sec-title">Инструменты</div>
     <div class="card pad">
@@ -1414,8 +1426,8 @@ function renderMore(){
     </div>
     ${AIOK ? `<div class="card pad">
       <b>🔮 Что если…</b>
-      <p class="hint" style="margin:4px 0 10px">Опишите кредит, смену зарплаты или цель накопления словами — покажу, как изменится прогноз, и применю после вашего подтверждения.</p>
-      <button class="btn" id="aiAsk">Спросить</button>
+      <p class="hint" style="margin:4px 0 10px">Опишите кредит, смену зарплаты или цель накопления словами. Изменения сразу покажутся в календаре как черновик; их можно уточнять в чате и слить в календарь, когда всё устроит.</p>
+      <button class="btn" id="aiAsk">${CHAT.length ? 'Продолжить чат' : 'Спросить'}</button>
     </div>` : ''}
     <div class="card pad">
       <b>Когда смогу купить?</b>
@@ -1451,7 +1463,7 @@ function renderMore(){
   if ($('invite')) $('invite').onclick = invite;
   if ($('leave')) $('leave').onclick = leaveShared;
   $('canBuy').onclick = canBuySheet;
-  if ($('aiAsk')) $('aiAsk').onclick = aiAskSheet;
+  if ($('aiAsk')) $('aiAsk').onclick = chatSheet;
   $('fxUpd').onclick = () => refreshRates(true);
   $('baseCur').onchange = e => changeBase(e.target.value);
   $('horizon').onchange = e => {
@@ -1469,7 +1481,8 @@ function renderMore(){
 }
 
 /* ================== Шторки (формы) ================== */
-function openSheet(html, mount){
+function openSheet(html, mount, opts){
+  if (DRAFT && !(opts && opts.draft)){ toast('Сейчас показан черновик «Что если». Слейте или отмените его, чтобы править данные'); return; }
   $('sheetBody').innerHTML = html; $('sheet').hidden = false;
   if (inTg){ tg.BackButton.show(); tg.BackButton.onClick(closeSheet); }
   mount && mount($('sheetBody'));
@@ -2121,32 +2134,14 @@ function aiContext(){
 }
 const AI_ERRORS = { ai_off: 'ИИ вам недоступен', limit_day: 'Дневной лимит запросов исчерпан, попробуйте завтра', limit_month: 'Месячный лимит запросов исчерпан',
   ai_busy: 'ИИ сейчас перегружен, повторите через минуту', ai_offline: 'Нет связи с ИИ, повторите позже', ai_error: 'Ошибка ИИ, повторите позже',
-  ai_bad_answer: 'ИИ ответил непонятно, переформулируйте фразу', bad_text: 'Фраза пустая или слишком длинная (до 400 знаков)', bad_context: 'Слишком много данных в календаре для запроса' };
-function aiAskSheet(){
-  openSheet(`
-    <h2>🔮 Что если…</h2>
-    <p class="hint" style="margin:-6px 0 12px">Опишите изменение своими словами — я посчитаю, как оно повлияет на прогноз. Ничего не изменится, пока вы не нажмёте «Применить». В ИИ уходят только платежи, названия счетов и категорий, без отдельных операций.</p>
-    <label class="field"><span>Например: «с марта кредит 400 в месяц 5-го числа» или «накопить 3000 на отпуск к июлю»</span><textarea id="f_q" rows="3" maxlength="400" style="width:100%;box-sizing:border-box;padding:10px;border-radius:10px;border:0;background:var(--bg2);color:var(--text);font:inherit"></textarea></label>
-    <button class="btn block" id="f_go">Посчитать</button>`,
-  b => {
-    const go = b.querySelector('#f_go');
-    go.onclick = async () => {
-      const text = b.querySelector('#f_q').value.trim();
-      if (!text) return toast('Опишите, что изменится');
-      go.disabled = true; go.textContent = 'Думаю…';
-      try {
-        const r = await api('ai', { text, context: aiContext() });
-        if (r.status !== 200){ toast(AI_ERRORS[r.data.error] || 'Не получилось, повторите позже'); return; }
-        aiResult(r.data);
-      } catch(e){ console.error(e); toast('Нет связи с сервером'); }
-      finally { go.disabled = false; go.textContent = 'Посчитать'; }
-    };
-  });
-}
-// Ответ ИИ → изменения; цель накопления раскрывается в переводы расчётом приложения
-function aiResult(data){
+  ai_bad_answer: 'ИИ вернул ответ в неожиданном виде. Это сбой на стороне сервиса, повторите запрос',
+  ai_truncated: 'Ответ ИИ оборвался, повторите запрос или опишите одно изменение за раз', ai_refused: 'ИИ отказался отвечать на этот запрос', bad_text: 'Фраза пустая или слишком длинная (до 400 знаков)', bad_context: 'Слишком много данных в календаре для запроса' };
+// Контекст для ИИ всегда строится по настоящим данным, а не по показанному черновику
+const realCtx = () => { if (!REAL) return aiContext(); const k = S; S = REAL; try { return aiContext(); } finally { S = k; } };
+// Ответ ИИ → конкретные изменения; цель накопления раскрывается в переводы расчётом приложения (S должен быть настоящим)
+function expandAi(list){
   const changes = [], notes = [], goals = [];
-  for (const c of data.changes || []){
+  for (const c of list || []){
     if (c.type !== 'savings_goal'){ changes.push(c); continue; }
     const id = findAccId(c.acc), target = num(c.amount);
     if (id === null || id === 'main' || !(target > 0) || !isDay(c.date)){ notes.push('Цель накопления не распознана: проверьте название счёта, сумму и дату.'); continue; }
@@ -2158,9 +2153,111 @@ function aiResult(data){
       if (!p.ok) notes.push(`К ${fmtDate(c.date)} получится собрать ${fmtMoney(p.reach)} из ${fmtMoney(target)}: основной счёт уйдёт в минус при больших переводах.`);
     }
   }
-  const summary = [data.summary, ...notes].filter(Boolean).join(' ');
-  if (!changes.length){ openSheet(`<h2>🔮 Что если…</h2><p class="hint">${esc(summary || 'Не удалось понять фразу.')}</p><button class="btn block" id="f_close">Закрыть</button>`, b => b.querySelector('#f_close').onclick = closeSheet); return; }
-  scenarioSheet('Что если…', changes, { summary, onApply: () => goals.forEach(g => { const a = accById(g.id); if (a) a.goal = { amount: g.amount, date: g.date }; }) });
+  return { changes, notes, goals };
+}
+
+/* ---------- Черновик «что если»: весь экран показывает S с применёнными изменениями, пока их не слили ---------- */
+// Данные не пишутся (saveState, writeState, pollShared, pullInbox и др. проверяют DRAFT), формы правок закрыты (openSheet).
+function persistDraft(){
+  try {
+    if (DRAFT || CHAT.length) localStorage.setItem('money_draft', JSON.stringify({ ai: DRAFT ? DRAFT.ai : [], chat: CHAT.slice(-20) }));
+    else localStorage.removeItem('money_draft');
+  } catch(e){}
+}
+function setDraft(ai){
+  if (!REAL) REAL = S;
+  const before = DRAFT ? DRAFT.before : (rebuild(), forecastMetrics());     // «Сейчас» — по настоящим данным
+  S = REAL;
+  const ex = expandAi(ai);
+  S = JSON.parse(JSON.stringify(REAL));
+  const log = applyChanges(ex.changes);
+  for (const g of ex.goals){ const a = accById(g.id); if (a) a.goal = { amount: g.amount, date: g.date }; }
+  DRAFT = { ai, changes: ex.changes, goals: ex.goals, notes: ex.notes, done: log.done, errors: log.errors, before };
+  persistDraft(); renderAll();
+}
+function leaveDraft(merge){
+  if (!DRAFT) return;
+  const d = DRAFT;
+  S = REAL; DRAFT = null; REAL = null; CHAT = [];
+  persistDraft();
+  if (merge){
+    const r = applyChanges(d.changes);
+    for (const g of d.goals){ const a = accById(g.id); if (a) a.goal = { amount: g.amount, date: g.date }; }
+    haptic('success'); commit(); freezeOps();
+    toast(r.errors.length ? 'Слито частично' : 'Изменения слиты в календарь');
+  } else { renderAll(); toast('Черновик отменён'); }
+  pullInbox();
+}
+async function mergeDraft(){
+  if (!DRAFT) return;
+  const n = DRAFT.done.length;
+  if (await ask(`Слить ${n} ${n === 1 ? 'изменение' : 'изменений'} в календарь? Данные будут изменены${SHARED ? ' и станут видны второму участнику' : ''}.`)){ closeSheet(); leaveDraft(true); }
+}
+async function cancelDraft(){
+  if (!DRAFT && !CHAT.length) return;
+  if (await ask('Отменить черновик и очистить чат? Календарь останется как был.')){ closeSheet(); if (DRAFT) leaveDraft(false); else { CHAT = []; persistDraft(); renderMore(); } }
+}
+function renderDraftBar(){
+  const el = $('draftBar');
+  el.hidden = !DRAFT; document.body.classList.toggle('drafting', !!DRAFT);
+  if (!DRAFT) return;
+  el.innerHTML = `<b>🔮 Черновик</b><span>${DRAFT.done.length} изм.</span><span class="grow"></span><button id="dChat">Чат</button><button id="dMerge" class="go">Слить</button><button id="dCancel">Отмена</button>`;
+  $('dChat').onclick = chatSheet; $('dMerge').onclick = mergeDraft; $('dCancel').onclick = cancelDraft;
+}
+// Восстановление черновика после перезапуска приложения: изменения применяются заново к текущим данным
+function restoreDraft(){
+  try {
+    const raw = localStorage.getItem('money_draft'); if (!raw) return;
+    const d = JSON.parse(raw);
+    CHAT = Array.isArray(d.chat) ? d.chat : [];
+    if (Array.isArray(d.ai) && d.ai.length){ setDraft(d.ai); toast('Восстановлен черновик «Что если»'); }
+  } catch(e){ console.error(e); }
+}
+
+/* ---------- Чат с ИИ: можно уточнять, ответ пересобирает черновик ---------- */
+function chatSheet(){
+  const t = DRAFT ? DRAFT : null, a = t ? forecastMetrics() : null, b = t ? t.before : null;
+  const money = v => v == null ? '—' : fmtMoney(v);
+  const negTxt = m => m.neg ? fmtDate(m.neg, {day:'numeric', month:'long'}) : 'нет';
+  const row = (label, x, y, bad) => `<tr><td>${label}</td><td class="num">${x}</td><td class="num ${bad ? 'negc' : ''}">${y}</td></tr>`;
+  openSheet(`
+    <h2>🔮 Что если…</h2>
+    ${CHAT.length ? '' : `<p class="hint" style="margin:-6px 0 10px">Опишите изменение своими словами, например «с ноября кредит 400 в месяц» или «накопить 3000 на счёт Отпуск к июлю». Результат сразу появится в календаре как черновик, его можно уточнять здесь же. Ничего не сохранится, пока вы не нажмёте «Слить». В ИИ уходят только платежи, названия счетов и категорий, без отдельных операций.</p>`}
+    ${CHAT.length ? `<div class="chat" id="chatLog">${CHAT.map(m => `<div class="msg ${m.role === 'user' ? 'u' : 'a'}">${esc(m.text)}</div>`).join('')}</div>` : ''}
+    ${t ? `${t.done.length ? `<ul class="list">${t.done.map(x => `<li class="row"><span class="t">${esc(x)}</span></li>`).join('')}</ul>` : ''}
+      ${[...t.errors, ...t.notes].length ? `<p class="hint" style="color:var(--red)">${[...t.errors, ...t.notes].map(esc).join('<br>')}</p>` : ''}
+      <table class="cmp"><tr><th></th><th>Сейчас</th><th>С черновиком</th></tr>
+        ${row('Уход в минус', negTxt(b), negTxt(a), a.neg && !b.neg)}
+        ${row('Минимум остатка', money(b.min), money(a.min), a.min != null && a.min < 0)}
+        ${row('В конце месяца', money(b.m1), money(a.m1))}
+        ${row('Через 3 мес.', money(b.m3), money(a.m3))}
+        ${row('Через 6 мес.', money(b.m6), money(a.m6))}
+        ${row('Через 12 мес.', money(b.m12), money(a.m12))}</table>` : ''}
+    <label class="field"><span>${t ? 'Уточните или поправьте' : 'Что изменится?'}</span><textarea id="f_q" rows="2" maxlength="400" style="width:100%;box-sizing:border-box;padding:10px;border-radius:10px;border:0;background:var(--bg2);color:var(--text);font:inherit"></textarea></label>
+    <button class="btn block" id="f_go">${t ? 'Уточнить' : 'Посчитать'}</button>
+    ${t ? '<button class="btn soft block" id="f_merge">Слить в календарь</button>' : ''}
+    <button class="btn soft block" id="f_hide">Закрыть чат${t ? ' (черновик останется)' : ''}</button>
+    ${t || CHAT.length ? '<button class="btn danger block" id="f_cancel">Отменить и начать заново</button>' : ''}`,
+  bd => {
+    const log = bd.querySelector('#chatLog'); if (log) log.scrollTop = log.scrollHeight;
+    const go = bd.querySelector('#f_go');
+    go.onclick = () => chatSend(bd.querySelector('#f_q').value.trim(), go);
+    bd.querySelector('#f_hide').onclick = closeSheet;
+    if (bd.querySelector('#f_merge')) bd.querySelector('#f_merge').onclick = mergeDraft;
+    if (bd.querySelector('#f_cancel')) bd.querySelector('#f_cancel').onclick = cancelDraft;
+  }, { draft: true });
+}
+async function chatSend(text, btn){
+  if (!text) return toast('Опишите, что изменится');
+  if (btn){ btn.disabled = true; btn.textContent = 'Думаю…'; }
+  try {
+    const r = await api('ai', { text, context: realCtx(), draft: DRAFT ? DRAFT.ai : [], history: CHAT.slice(-8) });
+    if (r.status !== 200){ toast(AI_ERRORS[r.data.error] || 'Не получилось, повторите позже'); if (btn){ btn.disabled = false; btn.textContent = DRAFT ? 'Уточнить' : 'Посчитать'; } return; }
+    CHAT.push({ role: 'user', text }, { role: 'assistant', text: r.data.summary || '…' });
+    // пустой ответ при уже собранном черновике — это вопрос ИИ, черновик остаётся как был
+    if ((r.data.changes || []).length) setDraft(r.data.changes); else persistDraft();
+    chatSheet();
+  } catch(e){ console.error(e); toast('Нет связи с сервером'); if (btn){ btn.disabled = false; btn.textContent = DRAFT ? 'Уточнить' : 'Посчитать'; } }
 }
 
 /* ---------- Подсказки: насколько прогноз расходится с фактом ---------- */
@@ -2303,7 +2400,7 @@ async function flushSave(){
 }
 let inboxBusy = false;
 async function pullInbox(){
-  if (!QUICK || LOAD_FAILED || LOCKED || inboxBusy || !$('sheet').hidden) return;
+  if (!QUICK || LOAD_FAILED || LOCKED || DRAFT || inboxBusy || !$('sheet').hidden) return;
   inboxBusy = true;
   try {
     const r = await api('inbox', {});
@@ -2344,7 +2441,7 @@ function buildProfile(){
   return { base: BASE, cats, top, dict };
 }
 async function sendProfile(){
-  if (!QUICK || LOAD_FAILED || LOCKED) return;
+  if (!QUICK || LOAD_FAILED || LOCKED || DRAFT) return;
   try { await api('profile', { profile: buildProfile() }); } catch(e){ console.error(e); }
 }
 document.addEventListener('visibilitychange', () => { if (!document.hidden){ pullInbox(); } });
@@ -2359,6 +2456,7 @@ document.addEventListener('visibilitychange', () => { if (!document.hidden){ pul
   renderAll(); selectDate(today());
   if (LOAD_FAILED) loadFailed();
   else if (!loaded) onboarding();
+  else restoreDraft();
   await pullInbox();
   sendProfile();
   await refreshRates();
