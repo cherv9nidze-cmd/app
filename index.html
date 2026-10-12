@@ -1159,6 +1159,97 @@ function donutSvg(parts, total){
     <text x="21" y="25" text-anchor="middle" font-size="3" style="fill:var(--hint);font-weight:400">${esc(curSign())}</text></svg>`;
 }
 
+/* ================== Отчёт для ИИ ================== */
+// Текстовый отчёт за 3 месяца (текущий и два прошлых) в Markdown: его вставляют в чат с ИИ для разбора трат.
+// Инкогнито-записи сюда не попадают: monthStats и EV с флагом priv их пропускают.
+function aiReport(){
+  const t = today(), now = new Date(), months = [-2, -1, 0].map(k => ymOf(now.getFullYear(), now.getMonth() + k));
+  const n0 = v => fmtNum(Math.round(v)).replace(/[  ]/g, ' ');
+  const n2 = v => fmtNum(v, 2).replace(/[  ]/g, ' ');
+  const cap = x => x.charAt(0).toUpperCase() + x.slice(1);
+  const mName = ({ y, m }) => cap(monthTitle(y, m)).replace(/ г\.$/, '');
+  const stats = months.map(({ y, m }) => monthStats(y, m));
+  const from = `${months[0].y}-${pad(months[0].m + 1)}-01`, to = lastDay(months[2].y, months[2].m);
+  const cur = curSign();
+  const L = [];
+  L.push('Ты — внимательный финансовый консультант. Ниже отчёт о моих личных финансах за 3 месяца. Проанализируй траты: куда уходит больше всего денег, что изменилось по месяцам, где можно сократить, хватает ли подушки безопасности и есть ли риск ухода в минус по прогнозу. Дай 3–5 конкретных советов с цифрами. Если данных не хватает, задай уточняющие вопросы.', '');
+  L.push(`# Отчёт о финансах на ${fmtDate(t, {day:'numeric', month:'long', year:'numeric'})}`, '');
+  L.push(`Валюта: ${BASE}. Период: ${mName(months[0])} — ${mName(months[2])}. Текущий месяц неполный: в «Доходах» и «Расходах» он включает запланированное до конца месяца.`, '');
+
+  L.push('## Итоги по месяцам', '', `| Месяц | Доходы | Расходы | Из них уже потрачено | Отложено на счета | Остаток основного на конец |`, '|---|---|---|---|---|---|');
+  months.forEach((mo, i) => {
+    const st = stats[i], end = balOn(lastDay(mo.y, mo.m));
+    L.push(`| ${mName(mo)}${i === 2 ? ' (идёт)' : ''} | ${n0(st.inc)} | ${n0(st.out)} | ${i === 2 ? n0(st.outToDate) : n0(st.out)} | ${n0(st.saved)} | ${end == null ? '—' : n0(end) + (i === 2 ? ' (прогноз)' : '')} |`);
+  });
+  L.push('');
+
+  const keys = [...new Set(stats.flatMap(st => Object.keys(st.byCat)))];
+  const total = k => stats.reduce((a, st) => a + (st.byCat[k] || 0), 0);
+  keys.sort((a, b) => total(b) - total(a));
+  const all = keys.reduce((a, k) => a + total(k), 0);
+  L.push('## Расходы по статьям', '', `| Статья | ${months.map(mName).join(' | ')} | Всего | Доля |`, `|---|${months.map(() => '---|').join('')}---|---|`);
+  for (const k of keys){
+    const info = catKeyInfo(k);
+    L.push(`| ${info.n} | ${stats.map(st => n0(st.byCat[k] || 0)).join(' | ')} | ${n0(total(k))} | ${pct(total(k), all)}% |`);
+  }
+  if (!keys.length) L.push('| расходов нет | | | | | |');
+  L.push('');
+
+  const big = [];
+  EV.forEach((list, d) => {
+    if (d < from || d > t) return;
+    for (const e of list) if (e.op && !e.priv && !isMove(e) && e.amount < 0 && e.op.cat !== 'plan') big.push({ d, v: -e.amount, e });
+  });
+  big.sort((a, b) => b.v - a.v);
+  L.push('## Крупнейшие разовые траты', '');
+  if (big.length) big.slice(0, 10).forEach(x => L.push(`- ${fmtDate(x.d)} · ${catKeyInfo(statKey(x.e)).n}${x.e.op.note ? ' (' + x.e.op.note + ')' : ''} · ${n2(x.v)} ${cur}`));
+  else L.push('Нет.');
+  L.push('');
+
+  L.push('## Регулярные доходы и платежи', '');
+  const ym = t.slice(0, 7), rl = [];
+  for (const r of S.rules){
+    const v = versionFor(r, ym);
+    if (!v || v.stop) continue;
+    const month = parse(t), o = occurrence(r, month.getFullYear(), month.getMonth());
+    rl.push(`- ${r.name} (${KINDS[r.kind].sign > 0 ? 'доход' : 'расход'}): ${n2(Math.abs(o ? o.amount : toBase(v.amount, v.cur)))} ${cur}, ${v.day}-го числа${evAcc(v.acc, t) !== 'main' ? ', ' + accLabel(v.acc).replace(/^\S+\s/, 'счёт «') + '»' : ''}`);
+  }
+  L.push(...(rl.length ? rl : ['Нет.']), '');
+
+  L.push('## Остатки сегодня', '');
+  const main = balOn(t);
+  L.push(`- Основной счёт: ${main == null ? '—' : n0(main)} ${cur}`);
+  let sum = main || 0;
+  for (const a of accList()) if (!(PRIV.accounts || []).includes(a)){ const b = accBal(a.id, t); sum += b; L.push(`- ${a.name}: ${n0(b)} ${cur}`); }
+  L.push(`- Всего: ${n0(sum)} ${cur}`, '');
+
+  L.push('## Прогноз основного счёта', '');
+  const neg = firstNegative(), ni = nextIncome(t);
+  const ends = [0, 1, 2].map(k => ymOf(now.getFullYear(), now.getMonth() + k)).map(({ y, m }) => `${mName({ y, m })}: ${n0(balOn(lastDay(y, m)) ?? 0)} ${cur}`);
+  L.push(`- Остаток на конец месяца: ${ends.join('; ')}`);
+  L.push(`- Уход в минус: ${neg ? 'ожидается ' + fmtDate(neg, {day:'numeric', month:'long', year:'numeric'}) : 'в пределах прогноза не ожидается'}`);
+  if (ni) L.push(`- Ближайший доход: «${ni.name}» через ${ni.days} дн., ${n0(ni.amount)} ${cur}`);
+  return L.join('\n');
+}
+function aiReportSheet(){
+  const text = aiReport();
+  openSheet(`
+    <h2>🤖 Отчёт для ИИ</h2>
+    <p class="hint" style="margin:-6px 0 12px">Итоги за 3 месяца с готовым запросом в начале. Скопируйте и вставьте в чат с Claude. Инкогнито-записи в отчёт не входят.</p>
+    <textarea id="f_rep" readonly rows="12" style="width:100%;box-sizing:border-box;padding:10px;border-radius:10px;border:0;background:var(--bg2);color:var(--text);font:12px/1.4 ui-monospace,monospace;margin-bottom:12px">${esc(text)}</textarea>
+    <button class="btn block" id="f_copy">Скопировать</button>`,
+  b => {
+    const ta = b.querySelector('#f_rep');
+    b.querySelector('#f_copy').onclick = async () => {
+      let done = false;
+      try { await navigator.clipboard.writeText(text); done = true; } catch(e){}
+      if (!done){ ta.focus(); ta.select(); try { done = document.execCommand('copy'); } catch(e){} }
+      haptic(done ? 'success' : 'error');
+      toast(done ? 'Скопировано' : 'Выделите текст и скопируйте вручную');
+    };
+  });
+}
+
 function renderStats(){
   const { y, m } = SM, t = today(), tm = t.slice(0, 7), key = `${y}-${pad(m+1)}`;
   const st = monthStats(y, m), pm = ymOf(y, m - 1), prev = monthStats(pm.y, pm.m);
@@ -1231,12 +1322,14 @@ function renderStats(){
     }).join('')}</div>` : '<div class="dash-card"><p class="empty-note" style="margin:0">В этом месяце расходов нет</p></div>'}
 
     <button class="btn soft block" id="sCats">🏷️ Категории расходов</button>
+    ${SHARED ? '<button class="btn soft block" id="sAi">🤖 Отчёт для ИИ</button>' : ''}
     <p class="hint">Сюда входят регулярные платежи и запланированные покупки. Переводы на счета-копилки — не расход, они показаны отдельно как «Отложено». Нажмите на категорию, чтобы увидеть записи.</p>`;
 
   $('sPrev').onclick = () => { SM = ymOf(y, m - 1); haptic(); renderStats(); };
   $('sNext').onclick = () => { SM = ymOf(y, m + 1); haptic(); renderStats(); };
   if ($('sNow')) $('sNow').onclick = () => { SM = ymOf(+tm.slice(0, 4), +tm.slice(5) - 1); renderStats(); };
   $('sCats').onclick = () => catManager();
+  if ($('sAi')) $('sAi').onclick = () => aiReportSheet();
   $('tab-stats').querySelectorAll('[data-cat]').forEach(el => el.onclick = () => catItems(el.dataset.cat, st));
 }
 
